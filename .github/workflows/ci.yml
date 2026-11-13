@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 4
+  RUSTC_WRAPPER: ""
+  RUSTC_WORKSPACE_WRAPPER: ""
+
+jobs:
+  fmt:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --component rustfmt && rustup default stable
+      - run: cargo fmt --check
+
+  clippy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
+      - run: cargo update
+      - run: nice -n 10 cargo clippy --all-targets -- -D warnings
+
+  parity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+      OPENFGA_URL: http://127.0.0.1:8080
+      OPENFGA_CONTAINER: rlspar-fga-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Start OpenFGA
+        run: |
+          docker run -d --name "$OPENFGA_CONTAINER" -p 127.0.0.1:8080:8080 openfga/openfga:v1.11.6 run
+          timeout 60 bash -c 'until curl --fail --silent "$OPENFGA_URL/healthz"; do sleep 1; done'
+      - run: cargo update
+      - run: nice -n 10 cargo test --release
+      - run: nice -n 10 cargo run --release
+      - name: OpenFGA failure logs
+        if: failure()
+        run: docker logs "$OPENFGA_CONTAINER"
+      - name: Remove OpenFGA
+        if: always()
+        run: docker rm -f "$OPENFGA_CONTAINER"
+
+  coverage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+      OPENFGA_URL: http://127.0.0.1:8080
+      OPENFGA_CONTAINER: rlspar-coverage-fga-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --component llvm-tools-preview && rustup default stable
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Start OpenFGA
+        run: |
+          docker run -d --name "$OPENFGA_CONTAINER" -p 127.0.0.1:8080:8080 openfga/openfga:v1.11.6 run
+          timeout 60 bash -c 'until curl --fail --silent "$OPENFGA_URL/healthz"; do sleep 1; done'
+      - run: cargo update
+      - run: nice -n 10 cargo llvm-cov -p rls-parity --all-targets --no-report
+      - run: nice -n 10 cargo llvm-cov run -p rls-parity --no-report
+      - run: cargo llvm-cov report -p rls-parity --include-build-script --lcov --output-path lcov.info
+      - name: Upload coverage
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7
+        with:
+          files: lcov.info
+          use_oidc: true
+          fail_ci_if_error: true
+      - name: OpenFGA failure logs
+        if: failure()
+        run: docker logs "$OPENFGA_CONTAINER"
+      - name: Remove OpenFGA
+        if: always()
+        run: docker rm -f "$OPENFGA_CONTAINER"
