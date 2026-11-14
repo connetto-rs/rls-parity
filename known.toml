@@ -1,0 +1,53 @@
+[[known]]
+case = "jsonb_numeric_owner"
+caller = "seven"
+row = "jdocs:1"
+statement = 'SELECT "id" FROM "jdocs"'
+engine = "sqlite"
+direction = "narrower"
+finding = "7, JSON numeric extraction returns an integer instead of text"
+
+[[known]]
+case = "jsonb_numeric_owner"
+caller = "true"
+row = "jdocs:3"
+statement = 'SELECT "id" FROM "jdocs"'
+engine = "sqlite"
+direction = "narrower"
+finding = "7, JSON boolean extraction returns an integer instead of text"
+
+[[known]]
+case = "partitioned"
+caller = "alice"
+row = "p:1"
+statement = 'SELECT "id" FROM "p"'
+engine = "sqlite"
+direction = "refused"
+finding = "8, SQLite translation refuses partitioned tables"
+
+[[known]]
+case = "partitioned"
+caller = "alice"
+row = "p:2"
+statement = 'SELECT "id" FROM "p"'
+engine = "sqlite"
+direction = "refused"
+finding = "8, SQLite translation refuses partitioned tables"
+
+[[known]]
+case = "partitioned"
+caller = "bob"
+row = "p:1"
+statement = 'SELECT "id" FROM "p"'
+engine = "sqlite"
+direction = "refused"
+finding = "8, SQLite translation refuses partitioned tables"
+
+[[known]]
+case = "partitioned"
+caller = "bob"
+row = "p:2"
+statement = 'SELECT "id" FROM "p"'
+engine = "sqlite"
+direction = "refused"
+finding = "8, SQLite translation refuses partitioned tables"

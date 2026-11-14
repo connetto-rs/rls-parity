@@ -1,0 +1,379 @@
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::Write,
+    time::Duration,
+};
+
+use anyhow::{Context, Result, anyhow, bail};
+use diesel::prelude::*;
+use reqwest::{Method, blocking::Client};
+use rls2fga::{
+    generator::tuple_generator::{TupleCondition, TupleRow},
+    parser::sql_parser::parse_schema,
+    translator::{Outputs, TranslatorBuilder},
+    types::{
+        ActionAnswer, ActionStatement, ColumnCommand, ConfidenceLevel, Record, RowVersion,
+        records_from_row,
+    },
+};
+use serde_json::{Value, json};
+
+use crate::{
+    Prepared,
+    case::{Caller, Case},
+    postgres::{Database, JsonRow},
+    rows::Row,
+};
+
+pub(crate) struct Model {
+    client: Client,
+    store_url: String,
+    id: String,
+    outputs: Outputs,
+    cleaned: bool,
+}
+
+impl Model {
+    /// Translate the schema and load the model's own records into a fresh store.
+    pub fn create(url: &str, case: &Case, database: &mut Database) -> Result<Prepared<Self>> {
+        let parsed = match parse_schema(&case.schema) {
+            Ok(parsed) => parsed,
+            Err(error) => return Ok(Prepared::Refused(error.to_string())),
+        };
+        let translation = match TranslatorBuilder::new(case.deployment()?)
+            .with_min_confidence(ConfidenceLevel::B)
+            .build()
+            .translate(&parsed)
+        {
+            Ok(translation) => translation,
+            Err(error) => return Ok(Prepared::Refused(error.to_string())),
+        };
+        for note in translation.notes() {
+            println!("{} OpenFGA note {note:?}", case.name);
+        }
+        let outputs = translation.outputs_accepting_gaps();
+        let client = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(5))
+            .build()?;
+        let store = request(
+            &client,
+            Method::POST,
+            &format!("{url}/stores"),
+            &json!({"name":case.name}),
+        )?;
+        let store_id = store["id"].as_str().context("Store response has no id")?;
+        let mut model = Self {
+            client,
+            store_url: format!("{url}/stores/{store_id}"),
+            id: String::new(),
+            outputs,
+            cleaned: false,
+        };
+        let created = request(
+            &model.client,
+            Method::POST,
+            &format!("{}/authorization-models", model.store_url),
+            &serde_json::to_value(model.outputs.json_model())?,
+        )?;
+        created["authorization_model_id"]
+            .as_str()
+            .context("Model response has no id")?
+            .clone_into(&mut model.id);
+        let records = load_records(&model.outputs, database)?;
+        for chunk in records.chunks(100) {
+            let tuples: Vec<Value> = chunk.iter().map(tuple).collect();
+            model.post(
+                "write",
+                &json!({"authorization_model_id":model.id,"writes":{"tuple_keys":tuples}}),
+            )?;
+        }
+        Ok(Prepared::Ready(model))
+    }
+
+    /// Ask the emitted action answer for the emitted name of this row.
+    pub fn visible(&self, case: &Case, caller: &Caller, row: &Value) -> Result<bool> {
+        let naming = self
+            .outputs
+            .translation()
+            .row_naming()
+            .iter()
+            .find(|naming| naming.table.name() == case.config.table)
+            .context("Translation has no row naming for the case table")?;
+        let object = naming
+            .render(&Row(row))?
+            .context("Row has no OpenFGA object name")?;
+        let entry = self
+            .outputs
+            .translation()
+            .action_relations()
+            .iter()
+            .find(|entry| {
+                entry.type_name == naming.type_name && entry.statement == ActionStatement::Select
+            })
+            .context("Translation has no SELECT answer")?;
+        self.answer(&entry.answer, &object, case, caller)
+    }
+
+    /// Interpret the translation's action answer without inferring relations.
+    fn answer(
+        &self,
+        answer: &ActionAnswer,
+        object: &str,
+        case: &Case,
+        caller: &Caller,
+    ) -> Result<bool> {
+        match answer {
+            ActionAnswer::Unrestricted => Ok(true),
+            ActionAnswer::Denied => Ok(false),
+            ActionAnswer::Judged(judgements) => {
+                for judgement in judgements {
+                    if judgement.version != RowVersion::Existing {
+                        bail!("SELECT judges a resulting row");
+                    }
+                    if !self.check(judgement.relation.as_str(), object, caller)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            ActionAnswer::ByColumn(columns) => {
+                if !self.answer(&columns.rows, object, case, caller)? {
+                    return Ok(false);
+                }
+                for command in &columns.commands {
+                    if command.command != ColumnCommand::Select {
+                        bail!("SELECT requires a non-SELECT column command");
+                    }
+                    for column in &case.config.columns {
+                        let column = rls2fga::types::ColumnName::from_stored(column);
+                        if !self.check(command.relation(&column).as_str(), &columns.gate, caller)? {
+                            return Ok(false);
+                        }
+                    }
+                }
+                Ok(true)
+            }
+            other => Err(anyhow!("Unsupported action answer {other:?}")),
+        }
+    }
+
+    /// Carry the acting role as a contextual tuple on every check.
+    fn check(&self, relation: &str, object: &str, caller: &Caller) -> Result<bool> {
+        let user = format!("user:{}", caller.settings["app.user_id"]);
+        let subjects: Vec<&str> = caller.settings["app.subjects"]
+            .split(',')
+            .filter(|item| !item.is_empty())
+            .collect();
+        let result = self.post("check", &json!({
+            "authorization_model_id":self.id,
+            "tuple_key":{"user":user,"relation":relation,"object":object},
+            "contextual_tuples":{"tuple_keys":[{"user":user,"relation":"usage","object":format!("pg_role:{}",caller.role)}]},
+            "context":{"settings":caller.settings,"app_subjects":subjects},
+            "consistency":"HIGHER_CONSISTENCY"
+        }))?;
+        result["allowed"]
+            .as_bool()
+            .context("Check response has no allowed answer")
+    }
+
+    /// Send a bounded request to this store.
+    fn post(&self, path: &str, body: &Value) -> Result<Value> {
+        request(
+            &self.client,
+            Method::POST,
+            &format!("{}/{path}", self.store_url),
+            body,
+        )
+    }
+
+    /// Delete the temporary store and surface cleanup failures.
+    pub fn cleanup(&mut self) -> Result<()> {
+        if !self.cleaned {
+            self.client
+                .delete(&self.store_url)
+                .send()?
+                .error_for_status()?;
+            self.cleaned = true;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Model {
+    fn drop(&mut self) {
+        if let Err(error) = self.cleanup() {
+            let _ = writeln!(std::io::stderr(), "OpenFGA cleanup failed {error:#}");
+        }
+    }
+}
+
+/// Send one bounded request and preserve any server refusal body.
+fn request(client: &Client, method: Method, url: &str, body: &Value) -> Result<Value> {
+    let response = client.request(method, url).json(body).send()?;
+    let status = response.status();
+    let text = response.text()?;
+    if !status.is_success() {
+        bail!("OpenFGA {url} returned {status} {text}");
+    }
+    Ok(serde_json::from_str(&text)?)
+}
+
+/// Load pure row descriptions and execute the remaining tuple queries.
+fn load_records(outputs: &Outputs, database: &mut Database) -> Result<Vec<Record>> {
+    let mut records = BTreeSet::new();
+    let mut rows = BTreeMap::new();
+    for query in outputs.tuple_queries() {
+        if query.skipped.is_some() {
+            continue;
+        }
+        if let Some(description) = &query.description
+            && let Some(table) = description.row_table()
+        {
+            let table = table.sql_name();
+            let table_rows = match rows.entry(table) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    let loaded = database.rows(entry.key())?;
+                    entry.insert(loaded)
+                }
+            };
+            for row in table_rows {
+                records.extend(records_from_row(description, &Row(row))?);
+            }
+            continue;
+        }
+        // The translator supplies the tuple query and its runtime result shape.
+        let tuples = diesel::sql_query(format!(
+            "SELECT to_jsonb(t) AS row FROM ({}) t",
+            query.sql.trim().trim_end_matches(';')
+        ))
+        .load::<JsonRow>(&mut database.connection)?;
+        for JsonRow { row } in tuples {
+            let context = row.get("context").map(Value::to_string);
+            let condition = if query.condition.is_some() {
+                Some(TupleCondition {
+                    name: row["condition"]
+                        .as_str()
+                        .context("Missing tuple condition")?,
+                    context: context.as_deref().context("Missing tuple context")?,
+                })
+            } else {
+                None
+            };
+            records.insert(outputs.record_from_tuple_row(TupleRow {
+                object: row["object"].as_str().context("Missing tuple object")?,
+                relation: row["relation"].as_str().context("Missing tuple relation")?,
+                subject: row["subject"].as_str().context("Missing tuple subject")?,
+                condition,
+            })?);
+        }
+    }
+    Ok(records.into_iter().collect())
+}
+
+/// Serialize the record without changing its relation or subject.
+fn tuple(record: &Record) -> Value {
+    let mut tuple =
+        json!({"object":record.object,"relation":record.relation.as_str(),"user":record.subject});
+    if let Some(context) = &record.context {
+        tuple["condition"] = json!({"name":context.condition.as_str(),"context":context.values});
+    }
+    tuple
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rls2fga::types::{ConditionName, RecordContextValue, RelationName};
+
+    /// Tuple serialization preserves emitted names and optional condition context.
+    #[test]
+    fn record_context_is_preserved() {
+        let mut record = Record {
+            object: "doc:1".into(),
+            relation: RelationName::canonicalized("owner"),
+            subject: "user:alice".into(),
+            context: None,
+        };
+        assert_eq!(
+            tuple(&record),
+            json!({"object":"doc:1","relation":"owner","user":"user:alice"})
+        );
+        record.context = Some(RecordContextValue {
+            condition: ConditionName::canonicalized("owner_matches"),
+            values: BTreeMap::from([("owner".into(), "alice".into())]),
+        });
+        assert_eq!(
+            tuple(&record),
+            json!({
+                "object":"doc:1","relation":"owner","user":"user:alice",
+                "condition":{"name":"owner_matches","context":{"owner":"alice"}}
+            })
+        );
+    }
+
+    /// Live column checks enforce both row ownership and projection privileges.
+    #[test]
+    fn live_column_answers() -> Result<()> {
+        let mut case = Case::read(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("cases/grant_without_update"),
+        )?;
+        case.schema = case
+            .schema
+            .replace("GRANT SELECT, INSERT", "GRANT SELECT (id), INSERT");
+        let database_url = std::env::var("DATABASE_URL")?;
+        let openfga_url = std::env::var("OPENFGA_URL")?;
+        let mut database = Database::create(&database_url, &case)?;
+        let Prepared::Ready(mut model) = Model::create(&openfga_url, &case, &mut database)? else {
+            panic!("column-grant fixture must translate");
+        };
+        let row = json!({"id":1,"owner":"alice","body":"a"});
+        let caller = &case.config.callers[0];
+        assert!(model.visible(&case, caller, &row)?);
+        assert!(!model.visible(&case, &case.config.callers[1], &row)?);
+        case.config.columns.push("body".into());
+        assert!(!model.visible(&case, caller, &row)?);
+        assert!(model.answer(&ActionAnswer::Unrestricted, "docs:1", &case, caller)?);
+        assert!(!model.answer(&ActionAnswer::Denied, "docs:1", &case, caller)?);
+        let resulting = ActionAnswer::Judged(vec![rls2fga::types::ActionJudgement::new(
+            RelationName::canonicalized("owner"),
+            RowVersion::Resulting,
+        )]);
+        assert!(model.answer(&resulting, "docs:1", &case, caller).is_err());
+        let mut answer = model
+            .outputs
+            .translation()
+            .action_relations()
+            .iter()
+            .find(|entry| entry.statement == ActionStatement::Select)
+            .context("SELECT action")?
+            .answer
+            .clone();
+        let ActionAnswer::ByColumn(columns) = &mut answer else {
+            panic!("column grant must emit column checks");
+        };
+        columns
+            .commands
+            .first_mut()
+            .context("column command")?
+            .command = ColumnCommand::Insert;
+        assert!(model.answer(&answer, "docs:1", &case, caller).is_err());
+        let error = model
+            .post("check", &json!({}))
+            .expect_err("incomplete check");
+        assert!(error.to_string().contains("400 Bad Request"), "{error}");
+        model.cleanup()?;
+        let schema = std::mem::replace(&mut case.schema, "INVALID SQL".into());
+        assert!(matches!(
+            Model::create(&openfga_url, &case, &mut database)?,
+            Prepared::Refused(_)
+        ));
+        case.schema = schema.replace("PRIMARY KEY", "");
+        let Prepared::Ready(model) = Model::create(&openfga_url, &case, &mut database)? else {
+            panic!("missing row key is an emitted gap");
+        };
+        assert!(model.visible(&case, &case.config.callers[0], &row).is_err());
+        Ok(())
+    }
+}
