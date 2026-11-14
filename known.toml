@@ -51,3 +51,291 @@ statement = 'SELECT "id" FROM "p"'
 engine = "sqlite"
 direction = "refused"
 finding = "8, SQLite translation refuses partitioned tables"
+
+[[known]]
+case = "column_grant_body"
+caller = "alice"
+row = "docs:1"
+statement = "SELECT \"id\", \"body\" FROM \"docs\""
+engine = "sqlite"
+direction = "error"
+finding = "5, SQLite exposes a column without its `SELECT` grant"
+
+[[known]]
+case = "column_grant_body"
+caller = "alice"
+row = "docs:1"
+statement = "SELECT \"id\", \"body\" FROM \"docs\""
+engine = "openfga"
+direction = "error"
+finding = "5, denied column access is hidden while PostgreSQL raises a privilege error"
+
+[[known]]
+case = "column_grant_body"
+caller = "alice"
+row = "docs:2"
+statement = "SELECT \"id\", \"body\" FROM \"docs\""
+engine = "sqlite"
+direction = "error"
+finding = "5, SQLite exposes a column without its `SELECT` grant"
+
+[[known]]
+case = "column_grant_body"
+caller = "alice"
+row = "docs:2"
+statement = "SELECT \"id\", \"body\" FROM \"docs\""
+engine = "openfga"
+direction = "error"
+finding = "5, denied column access is hidden while PostgreSQL raises a privilege error"
+
+[[known]]
+case = "column_grant_body"
+caller = "bob"
+row = "docs:1"
+statement = "SELECT \"id\", \"body\" FROM \"docs\""
+engine = "sqlite"
+direction = "error"
+finding = "5, SQLite exposes a column without its `SELECT` grant"
+
+[[known]]
+case = "column_grant_body"
+caller = "bob"
+row = "docs:1"
+statement = "SELECT \"id\", \"body\" FROM \"docs\""
+engine = "openfga"
+direction = "error"
+finding = "5, denied column access is hidden while PostgreSQL raises a privilege error"
+
+[[known]]
+case = "column_grant_body"
+caller = "bob"
+row = "docs:2"
+statement = "SELECT \"id\", \"body\" FROM \"docs\""
+engine = "sqlite"
+direction = "error"
+finding = "5, SQLite exposes a column without its `SELECT` grant"
+
+[[known]]
+case = "column_grant_body"
+caller = "bob"
+row = "docs:2"
+statement = "SELECT \"id\", \"body\" FROM \"docs\""
+engine = "openfga"
+direction = "error"
+finding = "5, denied column access is hidden while PostgreSQL raises a privilege error"
+
+[[known]]
+case = "insert_only_grant"
+caller = "alice"
+row = "docs:1"
+statement = "SELECT \"id\" FROM \"docs\""
+engine = "sqlite"
+direction = "error"
+finding = "5, the replica omits a table while PostgreSQL raises a privilege error"
+
+[[known]]
+case = "insert_only_grant"
+caller = "alice"
+row = "docs:1"
+statement = "SELECT \"id\" FROM \"docs\""
+engine = "openfga"
+direction = "error"
+finding = "5, missing `SELECT` privilege is hidden while PostgreSQL raises a privilege error"
+
+[[known]]
+case = "insert_only_grant"
+caller = "alice"
+row = "docs:2"
+statement = "SELECT \"id\" FROM \"docs\""
+engine = "sqlite"
+direction = "error"
+finding = "5, the replica omits a table while PostgreSQL raises a privilege error"
+
+[[known]]
+case = "insert_only_grant"
+caller = "alice"
+row = "docs:2"
+statement = "SELECT \"id\" FROM \"docs\""
+engine = "openfga"
+direction = "error"
+finding = "5, missing `SELECT` privilege is hidden while PostgreSQL raises a privilege error"
+
+[[known]]
+case = "insert_only_grant"
+caller = "bob"
+row = "docs:1"
+statement = "SELECT \"id\" FROM \"docs\""
+engine = "sqlite"
+direction = "error"
+finding = "5, the replica omits a table while PostgreSQL raises a privilege error"
+
+[[known]]
+case = "insert_only_grant"
+caller = "bob"
+row = "docs:1"
+statement = "SELECT \"id\" FROM \"docs\""
+engine = "openfga"
+direction = "error"
+finding = "5, missing `SELECT` privilege is hidden while PostgreSQL raises a privilege error"
+
+[[known]]
+case = "insert_only_grant"
+caller = "bob"
+row = "docs:2"
+statement = "SELECT \"id\" FROM \"docs\""
+engine = "sqlite"
+direction = "error"
+finding = "5, the replica omits a table while PostgreSQL raises a privilege error"
+
+[[known]]
+case = "insert_only_grant"
+caller = "bob"
+row = "docs:2"
+statement = "SELECT \"id\" FROM \"docs\""
+engine = "openfga"
+direction = "error"
+finding = "5, missing `SELECT` privilege is hidden while PostgreSQL raises a privilege error"
+
+[[known]]
+case = "self_referential"
+caller = "alice"
+row = "docs:1"
+statement = "SELECT \"id\" FROM \"docs\""
+engine = "sqlite"
+direction = "refused"
+finding = "8, SQLite refuses a recursive policy that PostgreSQL rejects during the read"
+
+[[known]]
+case = "self_referential"
+caller = "alice"
+row = "docs:1"
+statement = "SELECT \"id\" FROM \"docs\""
+engine = "openfga"
+direction = "error"
+finding = "8, recursive policy reads are hidden while PostgreSQL raises a recursion error"
+
+[[known]]
+case = "self_referential"
+caller = "alice"
+row = "docs:2"
+statement = "SELECT \"id\" FROM \"docs\""
+engine = "sqlite"
+direction = "refused"
+finding = "8, SQLite refuses a recursive policy that PostgreSQL rejects during the read"
+
+[[known]]
+case = "self_referential"
+caller = "alice"
+row = "docs:2"
+statement = "SELECT \"id\" FROM \"docs\""
+engine = "openfga"
+direction = "error"
+finding = "8, recursive policy reads are hidden while PostgreSQL raises a recursion error"
+
+[[known]]
+case = "self_referential"
+caller = "bob"
+row = "docs:1"
+statement = "SELECT \"id\" FROM \"docs\""
+engine = "sqlite"
+direction = "refused"
+finding = "8, SQLite refuses a recursive policy that PostgreSQL rejects during the read"
+
+[[known]]
+case = "self_referential"
+caller = "bob"
+row = "docs:1"
+statement = "SELECT \"id\" FROM \"docs\""
+engine = "openfga"
+direction = "error"
+finding = "8, recursive policy reads are hidden while PostgreSQL raises a recursion error"
+
+[[known]]
+case = "self_referential"
+caller = "bob"
+row = "docs:2"
+statement = "SELECT \"id\" FROM \"docs\""
+engine = "sqlite"
+direction = "refused"
+finding = "8, SQLite refuses a recursive policy that PostgreSQL rejects during the read"
+
+[[known]]
+case = "self_referential"
+caller = "bob"
+row = "docs:2"
+statement = "SELECT \"id\" FROM \"docs\""
+engine = "openfga"
+direction = "error"
+finding = "8, recursive policy reads are hidden while PostgreSQL raises a recursion error"
+
+[[known]]
+case = "separator_mismatch"
+caller = "holder"
+row = "docs:1"
+statement = "SELECT \"id\" FROM \"docs\""
+engine = "sqlite"
+direction = "refused"
+finding = "3, the declared set separator differs from the policy separator"
+
+[[known]]
+case = "separator_mismatch"
+caller = "holder"
+row = "docs:2"
+statement = "SELECT \"id\" FROM \"docs\""
+engine = "sqlite"
+direction = "refused"
+finding = "3, the declared set separator differs from the policy separator"
+
+[[known]]
+case = "uuid_owner_blob"
+caller = "a"
+row = "udocs:1"
+statement = "SELECT \"id\" FROM \"udocs\""
+engine = "sqlite"
+direction = "refused"
+finding = "4, the declared text caller setting is cast to `UUID` by the policy"
+
+[[known]]
+case = "uuid_owner_blob"
+caller = "a"
+row = "udocs:1"
+statement = "SELECT \"id\" FROM \"udocs\""
+engine = "openfga"
+direction = "narrower"
+finding = "4, the `UUID` caller cast falls below the translation confidence threshold"
+
+[[known]]
+case = "uuid_owner_blob"
+caller = "a"
+row = "udocs:2"
+statement = "SELECT \"id\" FROM \"udocs\""
+engine = "sqlite"
+direction = "refused"
+finding = "4, the declared text caller setting is cast to `UUID` by the policy"
+
+[[known]]
+case = "uuid_owner_blob"
+caller = "b"
+row = "udocs:1"
+statement = "SELECT \"id\" FROM \"udocs\""
+engine = "sqlite"
+direction = "refused"
+finding = "4, the declared text caller setting is cast to `UUID` by the policy"
+
+[[known]]
+case = "uuid_owner_blob"
+caller = "b"
+row = "udocs:2"
+statement = "SELECT \"id\" FROM \"udocs\""
+engine = "sqlite"
+direction = "refused"
+finding = "4, the declared text caller setting is cast to `UUID` by the policy"
+
+[[known]]
+case = "uuid_owner_blob"
+caller = "b"
+row = "udocs:2"
+statement = "SELECT \"id\" FROM \"udocs\""
+engine = "openfga"
+direction = "narrower"
+finding = "4, the `UUID` caller cast falls below the translation confidence threshold"
