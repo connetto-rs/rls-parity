@@ -112,10 +112,12 @@ impl Replica {
                     return Err(anyhow!("Seed must insert into a named table"));
                 };
                 let logical = name.to_string();
-                let entry = manifest
+                let Some(entry) = manifest
                     .iter()
                     .find(|entry| logical.trim_matches('"') == entry.logical)
-                    .with_context(|| format!("No emitted table for seed {logical}"))?;
+                else {
+                    continue;
+                };
                 insert.table = TableObject::TableName(ObjectName::from(vec![Ident::with_quote(
                     '"',
                     &entry.physical,

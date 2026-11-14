@@ -10,7 +10,9 @@ Each directory in `cases/` contains standalone `schema.sql`, `seed.sql` and `cal
 
 `known.toml` identifies each discrepancy by `case`, `caller`, `row`, `statement`, `engine`, `direction` and `finding`. Directions are `wider`, `narrower`, `refused` and `error`. Unexpected discrepancies and entries that no longer occur fail the run.
 
-The three cases cover ownership, numeric and boolean `jsonb` ownership, and a partitioned table. Only ordinary `SELECT` visibility is compared, including the read side of `grant_without_update`.
+Engine errors count as discrepancies even when both engines reject the read. An absent replica table reports its SQLite error for every oracle row.
+
+Cases cover role inheritance, caller settings, grants, policy interactions, and table layouts. Only ordinary `SELECT` visibility is compared, including the read side of write and locking probes. Both `to_role_member` variants use the declared acting role.
 
 ## Run
 

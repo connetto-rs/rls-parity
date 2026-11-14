@@ -10,6 +10,8 @@ fn live_known_entry_acceptance() {
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL for PostgreSQL 18");
     let openfga_url = std::env::var("OPENFGA_URL").expect("OPENFGA_URL for OpenFGA v1.11.6");
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    omitted_table_seed_is_skipped(root, &database_url, &openfga_url)
+        .expect("omitted replica table observations");
     let observations = observe_cases(&root.join("cases"), &database_url, &openfga_url)
         .expect("live three-engine observations");
     let mut known = read_known(&root.join("known.toml")).expect("known discrepancies");
@@ -168,6 +170,36 @@ fn fixture_edge_cases(root: &Path, database_url: &str, openfga_url: &str) -> any
                 assert!(matches!(observation.openfga, Answer::Refused(_)));
             }
         }
+    }
+    Ok(())
+}
+
+/// A table omitted by the replica remains an error for every oracle row.
+fn omitted_table_seed_is_skipped(
+    root: &Path,
+    database_url: &str,
+    openfga_url: &str,
+) -> anyhow::Result<()> {
+    let directory = tempfile::tempdir_in(root.join("target"))?;
+    let case = directory.path().join("insert_only_grant");
+    std::fs::create_dir(&case)?;
+    for filename in ["schema.sql", "seed.sql", "callers.toml"] {
+        std::fs::copy(
+            root.join("cases/insert_only_grant").join(filename),
+            case.join(filename),
+        )?;
+    }
+    let observations = observe_cases(directory.path(), database_url, openfga_url)?;
+    assert_eq!(observations.len(), 4);
+    for observation in &observations {
+        assert!(
+            matches!(&observation.postgres, Answer::Error(reason) if reason.contains("permission denied")),
+            "{observation:?}"
+        );
+        assert!(
+            matches!(&observation.sqlite, Answer::Error(reason) if reason.contains("no such table")),
+            "{observation:?}"
+        );
     }
     Ok(())
 }
