@@ -44,12 +44,12 @@ pub(crate) struct Replica {
 }
 
 impl Replica {
-    /// Load the emitted script and seed its published physical tables.
-    pub fn create(case: &Case) -> Result<Prepared<Self>> {
+    /// Load the script emitted for `role` and seed its published physical tables.
+    pub fn create(case: &Case, role: &str) -> Result<Prepared<Self>> {
         let jsonb = JsonbFunctions::new("jsonb_canonical", "jsonb_order");
         let options = Pg2SqliteOptions::default()
             .with_deployment(case.deployment()?)
-            .with_acting_role(&case.config.callers[0].role)
+            .with_acting_role(role)
             .with_uuid_representation(UuidRepresentation::Blob)
             .with_uuid_function_name("uuid_blob")
             .with_rls_audit_table_name("rls_audit".to_owned())
@@ -268,7 +268,8 @@ mod tests {
         case.config.callers[0]
             .settings
             .insert("app.subjects".into(), "alpha,beta".into());
-        let Prepared::Ready(mut replica) = Replica::create(&case)? else {
+        let role = case.config.callers[0].role.clone();
+        let Prepared::Ready(mut replica) = Replica::create(&case, &role)? else {
             panic!("ownership fixture must translate");
         };
         let select = case.statement(Shape::Select);
@@ -298,7 +299,10 @@ mod tests {
             .expect_err("a write is not a measured read");
         assert!(error.to_string().contains("one query"), "{error}");
         case.schema = "INVALID SQL".into();
-        assert!(matches!(Replica::create(&case)?, Prepared::Refused(_)));
+        assert!(matches!(
+            Replica::create(&case, &role)?,
+            Prepared::Refused(_)
+        ));
         Ok(())
     }
 }

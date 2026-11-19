@@ -91,10 +91,6 @@ impl Case {
         );
         for caller in &config.callers {
             ensure!(
-                caller.role == config.callers[0].role,
-                "A case uses one acting role"
-            );
-            ensure!(
                 caller.settings.len() == 2
                     && caller.settings.contains_key("app.user_id")
                     && caller.settings.contains_key("app.subjects"),
@@ -138,12 +134,23 @@ impl Case {
         })
     }
 
-    /// Declare connetto's caller and packed subject inputs.
+    /// Every acting role the callers name, in the order they first appear.
+    pub fn acting_roles(&self) -> Vec<&str> {
+        let mut roles: Vec<&str> = Vec::new();
+        for caller in &self.config.callers {
+            if !roles.contains(&caller.role.as_str()) {
+                roles.push(&caller.role);
+            }
+        }
+        roles
+    }
+
+    /// Declare connetto's caller and packed subject inputs, logging in as the first caller's
+    /// role and acting as every role a caller names.
     pub fn deployment(&self) -> Result<Deployment> {
-        let role = &self.config.callers[0].role;
         Ok(Deployment::new(
-            role,
-            [role.as_str()],
+            &self.config.callers[0].role,
+            self.acting_roles(),
             [
                 SessionSetting::value("app.user_id", SettingValue::Caller(DataType::Text))?,
                 SessionSetting::value(
@@ -312,10 +319,6 @@ mod tests {
             (
                 valid.replace("columns = [\"id\"]", "columns = []"),
                 "Projection must include",
-            ),
-            (
-                valid.replacen("app_reader", "other_reader", 1),
-                "one acting role",
             ),
             (
                 valid.replace(", \"app.subjects\" = \"\"", ""),

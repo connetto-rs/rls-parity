@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::{
     Acceptance, Answer, KnownList, Measurements, Observation, Outcome, Prepared,
-    case::{Case, Shape, Write, identifier, key_text},
+    case::{Caller, Case, Shape, Write, identifier, key_text},
     openfga::{Model, Probe},
     postgres::Database,
     sqlite::Replica,
@@ -104,11 +104,10 @@ fn run_case(
         Database::create(database_url, &case).with_context(|| format!("Creating {}", case.name))?;
     let rows = database.rows(&identifier(&case.config.table))?;
     ensure!(!rows.is_empty(), "{} has no seeded rows", case.name);
-    let mut replica =
-        Replica::create(&case).with_context(|| format!("Loading SQLite for {}", case.name))?;
+    let mut replicas = replicas(&case)?;
     let model = Model::create(openfga_url, &case, &mut database)
         .with_context(|| format!("Loading OpenFGA for {}", case.name))?;
-    let acceptance = acceptance(&case, &replica, &model);
+    let acceptance = acceptance(&case, &replicas, &model);
     let mut observations = Vec::new();
     let read_columns = case.read_columns();
     let shapes: Vec<_> = case.shapes().collect();
@@ -116,7 +115,7 @@ fn run_case(
         let statement = case.statement(shape);
         for (caller_index, caller) in case.config.callers.iter().enumerate() {
             let postgres = database.visible(&case, caller, &statement);
-            let sqlite = on_replica(&mut replica, |replica| {
+            let sqlite = on_replica(role_replica(&mut replicas, caller)?, |replica| {
                 replica.visible(&case, caller_index, &statement)
             });
             for row in &rows {
@@ -158,7 +157,7 @@ fn run_case(
         for (caller_index, caller) in case.config.callers.iter().enumerate() {
             for target in &targets {
                 let postgres = database.write(&case, caller, &target.statement);
-                let sqlite = on_replica(&mut replica, |replica| {
+                let sqlite = on_replica(role_replica(&mut replicas, caller)?, |replica| {
                     replica.write(caller_index, &target.statement)
                 });
                 for row in &target.rows {
@@ -201,19 +200,50 @@ fn run_case(
     Ok((acceptance, observations))
 }
 
-/// Each translator's verdict on the case's schema, the way connetto gates it.
-fn acceptance(case: &Case, replica: &Prepared<Replica>, model: &Prepared<Model>) -> Acceptance {
+/// Each translator's verdict on the case's schema, the way connetto gates it. `pg2sqlite`
+/// refuses the schema when it refuses any acting role's translation.
+fn acceptance(
+    case: &Case,
+    replicas: &BTreeMap<String, Prepared<Replica>>,
+    model: &Prepared<Model>,
+) -> Acceptance {
+    let refusals: Vec<String> = replicas
+        .iter()
+        .filter_map(|(role, replica)| match replica {
+            Prepared::Ready(_) => None,
+            Prepared::Refused(reason) => Some(format!("{role}: {reason}")),
+        })
+        .collect();
     Acceptance {
         case: case.name.clone(),
-        sqlite: match replica {
-            Prepared::Ready(_) => None,
-            Prepared::Refused(reason) => Some(reason.clone()),
-        },
+        sqlite: (!refusals.is_empty()).then(|| refusals.join("\n")),
         openfga: match model {
             Prepared::Ready(model) => model.divergence().map(ToOwned::to_owned),
             Prepared::Refused(reason) => Some(reason.clone()),
         },
     }
+}
+
+/// The replica `pg2sqlite` translated for the caller's acting role.
+fn role_replica<'replicas>(
+    replicas: &'replicas mut BTreeMap<String, Prepared<Replica>>,
+    caller: &Caller,
+) -> Result<&'replicas mut Prepared<Replica>> {
+    replicas
+        .get_mut(&caller.role)
+        .context("No replica for the caller's acting role")
+}
+
+/// Translate one replica per acting role the callers name.
+fn replicas(case: &Case) -> Result<BTreeMap<String, Prepared<Replica>>> {
+    case.acting_roles()
+        .into_iter()
+        .map(|role| {
+            let replica = Replica::create(case, role)
+                .with_context(|| format!("Loading SQLite for {} acting as {role}", case.name))?;
+            Ok((role.to_owned(), replica))
+        })
+        .collect()
 }
 
 /// One write statement a caller runs and the rows it answers for.
