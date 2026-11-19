@@ -1,4 +1,5 @@
-table = "docs"
+[[tables]]
+name = "docs"
 key = "id"
 columns = ["id"]
 
@@ -13,5 +14,6 @@ role = "app_reader"
 settings = { "app.user_id" = "bob", "app.subjects" = "" }
 
 [[writes]]
+table = "docs"
 shape = "update"
 set = { owner = "bob" }

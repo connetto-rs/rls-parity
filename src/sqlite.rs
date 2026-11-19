@@ -19,7 +19,7 @@ use sqlparser::ast::{Ident, ObjectName, Statement, TableObject};
 
 use crate::{
     Outcome, Prepared,
-    case::{Case, identifier},
+    case::{Case, Table, identifier},
     postgres::KeyRow,
 };
 
@@ -136,12 +136,7 @@ impl Replica {
                 .with_context(|| format!("Seeding {statement}"))?;
         }
         session.exempt.store(false, Ordering::Relaxed);
-        // The physical table is known only once pg2sqlite has translated the case.
-        let physical = manifest
-            .iter()
-            .find(|entry| entry.logical == case.config.table)
-            .map(|entry| entry.physical.as_str());
-        track_changes(&mut connection, physical, &case.config.key)?;
+        track_changes(&mut connection, &case.config.tables, &manifest)?;
         Ok(Prepared::Ready(Self {
             connection,
             session,
@@ -150,10 +145,11 @@ impl Replica {
         }))
     }
 
-    /// Run pg2sqlite's own translation of `statement` with the caller's session functions.
+    /// Run pg2sqlite's own translation of `statement` with the caller's session functions,
+    /// collecting the keys of the `table` rows it returns.
     pub fn visible(
         &mut self,
-        case: &Case,
+        table: &Table,
         caller: usize,
         statement: &str,
     ) -> Result<Prepared<BTreeSet<String>>> {
@@ -171,7 +167,7 @@ impl Replica {
         // The case supplies the statement and row key at runtime.
         let rows = diesel::sql_query(format!(
             "SELECT CAST({} AS TEXT) AS key FROM ({query}) q",
-            identifier(&case.config.key),
+            identifier(&table.key),
         ))
         .load::<KeyRow>(&mut self.connection)?;
         Ok(Prepared::Ready(
@@ -179,8 +175,14 @@ impl Replica {
         ))
     }
 
-    /// Run pg2sqlite's translation of the write `statement` as the caller, rolled back.
-    pub fn write(&mut self, caller: usize, statement: &str) -> Result<Prepared<Outcome>> {
+    /// Run pg2sqlite's translation of the write `statement` as the caller, rolled back,
+    /// collecting the keys of the rows of `table` it wrote.
+    pub fn write(
+        &mut self,
+        table: &Table,
+        caller: usize,
+        statement: &str,
+    ) -> Result<Prepared<Outcome>> {
         let translated = match self.translate(caller, statement)? {
             Prepared::Ready(translated) => translated,
             Prepared::Refused(reason) => return Ok(Prepared::Refused(reason)),
@@ -198,7 +200,8 @@ impl Replica {
                     return Err(error.into());
                 }
             }
-            let changed = diesel::sql_query("SELECT key FROM probe_changes")
+            let changed = diesel::sql_query("SELECT key FROM probe_changes WHERE logical = ?")
+                .bind::<Text, _>(&table.name)
                 .load::<KeyRow>(&mut self.connection)?;
             Ok(Outcome::Applied(
                 changed.into_iter().map(|row| row.key).collect(),
@@ -228,28 +231,35 @@ impl Replica {
     }
 }
 
-/// Record the key of every row a statement writes to `physical` in `probe_changes`.
+/// Record in `probe_changes` the logical table and key of every row a statement writes to
+/// each of `tables` that the replica publishes.
 fn track_changes(
     connection: &mut SqliteConnection,
-    physical: Option<&str>,
-    key: &str,
+    tables: &[Table],
+    manifest: &[TableManifestEntry],
 ) -> Result<()> {
-    connection.batch_execute("CREATE TEMP TABLE probe_changes (key TEXT NOT NULL)")?;
-    let Some(physical) = physical else {
-        return Ok(());
-    };
-    let physical = identifier(physical);
-    let old = format!("(CAST(OLD.{} AS TEXT))", identifier(key));
-    let new = format!("(CAST(NEW.{} AS TEXT))", identifier(key));
-    for (event, rows) in [
-        ("INSERT", new.clone()),
-        ("UPDATE", format!("{old}, {new}")),
-        ("DELETE", old),
-    ] {
-        connection.batch_execute(&format!(
-            "CREATE TEMP TRIGGER probe_{event} AFTER {event} ON main.{physical} \
-             BEGIN INSERT INTO probe_changes VALUES {rows}; END"
-        ))?;
+    connection.batch_execute(
+        "CREATE TEMP TABLE probe_changes (logical TEXT NOT NULL, key TEXT NOT NULL)",
+    )?;
+    for (index, table) in tables.iter().enumerate() {
+        // A table the translation omits has no physical counterpart to watch.
+        let Some(entry) = manifest.iter().find(|entry| entry.logical == table.name) else {
+            continue;
+        };
+        let logical = format!("'{}'", table.name.replace('\'', "''"));
+        let physical = identifier(&entry.physical);
+        let old = format!("({logical}, CAST(OLD.{} AS TEXT))", identifier(&table.key));
+        let new = format!("({logical}, CAST(NEW.{} AS TEXT))", identifier(&table.key));
+        for (event, rows) in [
+            ("INSERT", new.clone()),
+            ("UPDATE", format!("{old}, {new}")),
+            ("DELETE", old),
+        ] {
+            connection.batch_execute(&format!(
+                "CREATE TEMP TRIGGER probe_{index}_{event} AFTER {event} ON main.{physical} \
+                 BEGIN INSERT INTO probe_changes VALUES {rows}; END"
+            ))?;
+        }
     }
     Ok(())
 }
@@ -272,9 +282,10 @@ mod tests {
         let Prepared::Ready(mut replica) = Replica::create(&case, &role)? else {
             panic!("ownership fixture must translate");
         };
-        let select = case.statement(Shape::Select);
+        let table = &case.config.tables[0];
+        let select = table.statement(Shape::Select);
         for (index, caller) in case.config.callers.iter().enumerate() {
-            replica.visible(&case, index, &select)?;
+            replica.visible(table, index, &select)?;
             let actual = diesel::select((current_app_user(), current_subjects(), write_exempt()))
                 .get_result::<(String, String, bool)>(&mut replica.connection)?;
             assert_eq!(
@@ -287,15 +298,15 @@ mod tests {
             );
         }
         let error = replica
-            .visible(&case, case.config.callers.len(), &select)
+            .visible(table, case.config.callers.len(), &select)
             .expect_err("invalid caller");
         assert!(error.to_string().contains("outside the case"));
         assert!(matches!(
-            replica.visible(&case, 0, "INVALID SQL")?,
+            replica.visible(table, 0, "INVALID SQL")?,
             Prepared::Refused(_)
         ));
         let error = replica
-            .visible(&case, 0, "DELETE FROM docs")
+            .visible(table, 0, "DELETE FROM docs")
             .expect_err("a write is not a measured read");
         assert!(error.to_string().contains("one query"), "{error}");
         case.schema = "INVALID SQL".into();

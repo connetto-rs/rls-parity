@@ -1,4 +1,5 @@
-table = "jdocs"
+[[tables]]
+name = "jdocs"
 key = "id"
 columns = ["id"]
 

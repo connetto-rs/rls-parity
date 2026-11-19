@@ -49,6 +49,8 @@ impl Shape {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Write {
+    /// The declared table the write targets.
+    pub table: String,
     pub shape: Shape,
     /// Columns an update assigns, with the values it assigns.
     #[serde(default)]
@@ -58,12 +60,19 @@ pub(crate) struct Write {
     pub row: BTreeMap<String, Value>,
 }
 
+/// A measured table, its row key and the columns a read projects.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Table {
+    pub name: String,
+    pub key: String,
+    pub columns: Vec<String>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Config {
-    pub table: String,
-    pub key: String,
-    pub columns: Vec<String>,
+    pub tables: Vec<Table>,
     pub callers: Vec<Caller>,
     #[serde(default)]
     pub writes: Vec<Write>,
@@ -85,10 +94,21 @@ impl Case {
             "No callers in {}",
             path.display()
         );
-        ensure!(
-            config.columns.contains(&config.key),
-            "Projection must include the row key"
-        );
+        ensure!(!config.tables.is_empty(), "No tables in {}", path.display());
+        for (index, table) in config.tables.iter().enumerate() {
+            ensure!(
+                table.columns.contains(&table.key),
+                "Projection of {} must include the row key",
+                table.name
+            );
+            ensure!(
+                config.tables[..index]
+                    .iter()
+                    .all(|earlier| earlier.name != table.name),
+                "Table {} is declared twice",
+                table.name
+            );
+        }
         for caller in &config.callers {
             ensure!(
                 caller.settings.len() == 2
@@ -98,6 +118,11 @@ impl Case {
             );
         }
         for write in &config.writes {
+            let table = config
+                .tables
+                .iter()
+                .find(|table| table.name == write.table)
+                .with_context(|| format!("A write targets undeclared table {}", write.table))?;
             ensure!(
                 write.shape != Shape::Select,
                 "Every case already measures SELECT"
@@ -117,7 +142,7 @@ impl Case {
                 if needs_row { "requires" } else { "takes no" }
             );
             ensure!(
-                !needs_row || write.row.contains_key(&config.key),
+                !needs_row || write.row.contains_key(&table.key),
                 "An inserted row must carry the row key"
             );
         }
@@ -164,14 +189,23 @@ impl Case {
         )?)
     }
 
-    /// Every read shape this case measures, `SELECT` first.
-    pub fn shapes(&self) -> impl Iterator<Item = Shape> + '_ {
+    /// The declared table named `name`.
+    pub fn table(&self, name: &str) -> Result<&Table> {
+        self.config
+            .tables
+            .iter()
+            .find(|table| table.name == name)
+            .with_context(|| format!("No declared table {name}"))
+    }
+
+    /// Every read shape this case measures on `table`, `SELECT` first.
+    pub fn reads<'case>(&'case self, table: &'case Table) -> impl Iterator<Item = Shape> + 'case {
         std::iter::once(Shape::Select).chain(
             self.config
                 .writes
                 .iter()
-                .map(|write| write.shape)
-                .filter(|shape| shape.reads()),
+                .filter(move |write| write.shape.reads() && write.table == table.name)
+                .map(|write| write.shape),
         )
     }
 
@@ -182,18 +216,19 @@ impl Case {
             .iter()
             .filter(|write| !write.shape.reads())
     }
+}
 
+impl Table {
     /// Build the read measured under a read shape.
     pub fn statement(&self, shape: Shape) -> String {
         let read = format!(
             "SELECT {} FROM {}",
-            self.config
-                .columns
+            self.columns
                 .iter()
                 .map(|column| identifier(column))
                 .collect::<Vec<_>>()
                 .join(", "),
-            identifier(&self.config.table)
+            identifier(&self.name)
         );
         if shape == Shape::SelectForUpdate {
             format!("{read} FOR UPDATE")
@@ -213,7 +248,7 @@ impl Case {
     }
 
     fn write_sql(&self, write: &Write, key: Option<&Value>, returning: bool) -> String {
-        let table = identifier(&self.config.table);
+        let table = identifier(&self.name);
         let alias = if returning { " AS t" } else { "" };
         let returning = if returning {
             " RETURNING to_jsonb(t) AS row"
@@ -221,7 +256,7 @@ impl Case {
             ""
         };
         let filter = key.map_or_else(String::new, |key| {
-            format!(" WHERE {} = {}", identifier(&self.config.key), literal(key))
+            format!(" WHERE {} = {}", identifier(&self.key), literal(key))
         });
         match write.shape {
             Shape::Insert => format!(
@@ -254,7 +289,7 @@ impl Case {
 
     /// The columns a read touches under each column command.
     pub fn read_columns(&self) -> BTreeMap<ColumnCommand, Vec<String>> {
-        BTreeMap::from([(ColumnCommand::Select, self.config.columns.clone())])
+        BTreeMap::from([(ColumnCommand::Select, self.columns.clone())])
     }
 }
 
@@ -312,13 +347,29 @@ mod tests {
         let directory = tempfile::tempdir_in(root)?;
         let valid = include_str!("../cases/grant_without_update/callers.toml");
         for (config, expected) in [
+            ("tables=[]\ncallers=[]".to_owned(), "No callers"),
             (
-                "table='docs'\nkey='id'\ncolumns=['id']\ncallers=[]".to_owned(),
-                "No callers",
+                format!(
+                    "tables = []\n{}",
+                    &valid[valid.find("[[callers]]").unwrap_or(0)..]
+                ),
+                "No tables",
+            ),
+            (
+                valid.replacen("[[tables]]", "[[unused]]", 1),
+                "unknown field",
             ),
             (
                 valid.replace("columns = [\"id\"]", "columns = []"),
-                "Projection must include",
+                "Projection of docs must include",
+            ),
+            (
+                format!("{valid}\n[[tables]]\nname = \"docs\"\nkey = \"id\"\ncolumns = [\"id\"]\n"),
+                "declared twice",
+            ),
+            (
+                format!("{valid}\n[[writes]]\ntable = \"other\"\nshape = \"delete\"\n"),
+                "undeclared table other",
             ),
             (
                 valid.replace(", \"app.subjects\" = \"\"", ""),
@@ -330,27 +381,33 @@ mod tests {
             ),
             (format!("unknown = true\n{valid}"), "unknown field"),
             (
-                format!("{valid}\n[[writes]]\nshape = \"select\"\n"),
+                format!("{valid}\n[[writes]]\ntable = \"docs\"\nshape = \"select\"\n"),
                 "already measures SELECT",
             ),
             (
-                format!("{valid}\n[[writes]]\nshape = \"update\"\n"),
+                format!("{valid}\n[[writes]]\ntable = \"docs\"\nshape = \"update\"\n"),
                 "requires `set`",
             ),
             (
-                format!("{valid}\n[[writes]]\nshape = \"delete\"\nset = {{ body = \"x\" }}\n"),
+                format!(
+                    "{valid}\n[[writes]]\ntable = \"docs\"\nshape = \"delete\"\nset = {{ body = \"x\" }}\n"
+                ),
                 "takes no `set`",
             ),
             (
-                format!("{valid}\n[[writes]]\nshape = \"insert\"\n"),
+                format!("{valid}\n[[writes]]\ntable = \"docs\"\nshape = \"insert\"\n"),
                 "requires `row`",
             ),
             (
-                format!("{valid}\n[[writes]]\nshape = \"delete\"\nrow = {{ id = 9 }}\n"),
+                format!(
+                    "{valid}\n[[writes]]\ntable = \"docs\"\nshape = \"delete\"\nrow = {{ id = 9 }}\n"
+                ),
                 "takes no `row`",
             ),
             (
-                format!("{valid}\n[[writes]]\nshape = \"insert\"\nrow = {{ owner = \"alice\" }}\n"),
+                format!(
+                    "{valid}\n[[writes]]\ntable = \"docs\"\nshape = \"insert\"\nrow = {{ owner = \"alice\" }}\n"
+                ),
                 "must carry the row key",
             ),
         ] {
@@ -368,10 +425,11 @@ mod tests {
     fn quoted_projection() -> Result<()> {
         let mut case =
             Case::read(&Path::new(env!("CARGO_MANIFEST_DIR")).join("cases/grant_without_update"))?;
-        case.config.table = "odd\"table".into();
-        case.config.columns = vec!["id".into(), "odd\"column".into()];
+        let table = &mut case.config.tables[0];
+        table.name = "odd\"table".into();
+        table.columns = vec!["id".into(), "odd\"column".into()];
         assert_eq!(
-            case.statement(Shape::Select),
+            table.statement(Shape::Select),
             "SELECT \"id\", \"odd\"\"column\" FROM \"odd\"\"table\""
         );
         Ok(())
@@ -383,11 +441,13 @@ mod tests {
         let case =
             Case::read(&Path::new(env!("CARGO_MANIFEST_DIR")).join("cases/grant_without_update"))?;
         let write: Write = serde_json::from_value(serde_json::json!({
+            "table": "docs",
             "shape": "update",
             "set": { "a": null, "b": true, "c": "it's", "d": ["x'y"] },
         }))?;
         assert_eq!(
-            case.write_statement(&write, Some(&"o'k".into())),
+            case.table("docs")?
+                .write_statement(&write, Some(&"o'k".into())),
             "UPDATE \"docs\" SET \"a\" = NULL, \"b\" = true, \"c\" = 'it''s', \"d\" = '[\"x''y\"]' \
              WHERE \"id\" = 'o''k'"
         );

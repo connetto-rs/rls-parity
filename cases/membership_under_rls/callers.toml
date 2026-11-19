@@ -1,6 +1,12 @@
-table = "tdocs"
+[[tables]]
+name = "tdocs"
 key = "id"
 columns = ["id"]
+
+[[tables]]
+name = "members"
+key = "user_id"
+columns = ["team", "user_id"]
 
 [[callers]]
 name = "alice"

@@ -1,4 +1,5 @@
-table = "p"
+[[tables]]
+name = "p"
 key = "id"
 columns = ["id"]
 

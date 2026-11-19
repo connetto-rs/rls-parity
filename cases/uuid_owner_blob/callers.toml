@@ -1,4 +1,5 @@
-table = "udocs"
+[[tables]]
+name = "udocs"
 key = "id"
 columns = ["id"]
 

@@ -16,7 +16,7 @@ use sqlparser::{ast::Statement, dialect::PostgreSqlDialect, parser::Parser};
 
 use crate::{
     Outcome,
-    case::{Caller, Case, identifier},
+    case::{Caller, Case, Table, identifier},
 };
 
 #[derive(QueryableByName)]
@@ -151,10 +151,11 @@ impl Database {
         )
     }
 
-    /// Run `statement` under the caller's role and settings and collect the row keys it returns.
+    /// Run `statement` under the caller's role and settings and collect the keys of the
+    /// `table` rows it returns.
     pub fn visible(
         &mut self,
-        case: &Case,
+        table: &Table,
         caller: &Caller,
         statement: &str,
     ) -> Result<BTreeSet<String>> {
@@ -164,7 +165,7 @@ impl Database {
             // The case's statement and row key are runtime fixture data.
             let rows = diesel::sql_query(format!(
                 "SELECT CAST({} AS TEXT) AS key FROM ({statement}) q",
-                identifier(&case.config.key),
+                identifier(&table.key),
             ))
             .load::<KeyRow>(&mut self.connection)?;
             Ok(rows.into_iter().map(|row| row.key).collect())
@@ -173,11 +174,11 @@ impl Database {
         result
     }
 
-    /// Run the write `statement` under the caller's role and settings, rolled back.
-    pub fn write(&mut self, case: &Case, caller: &Caller, statement: &str) -> Result<Outcome> {
+    /// Run the write `statement` on `table` under the caller's role and settings, rolled back.
+    pub fn write(&mut self, table: &Table, caller: &Caller, statement: &str) -> Result<Outcome> {
         self.connection.batch_execute("BEGIN")?;
         let result = (|| {
-            let before = self.stored(case)?;
+            let before = self.stored(table)?;
             self.act_as(caller)?;
             // The case's write is runtime fixture data.
             if let Err(error) = diesel::sql_query(statement).execute(&mut self.connection) {
@@ -189,7 +190,7 @@ impl Database {
                 return Err(error.into());
             }
             self.connection.batch_execute("RESET ROLE")?;
-            Ok(Outcome::Applied(changed(&before, &self.stored(case)?)))
+            Ok(Outcome::Applied(changed(&before, &self.stored(table)?)))
         })();
         self.connection.batch_execute("ROLLBACK")?;
         result
@@ -208,14 +209,14 @@ impl Database {
             .map(|row| row.row))
     }
 
-    /// Read the version of every stored row of the case table as the owner, keyed by its
-    /// row key, so a write that leaves a row's values as they were still shows as a change.
-    fn stored(&mut self, case: &Case) -> Result<BTreeMap<String, String>> {
+    /// Read the version of every stored row of `table` as the owner, keyed by its row key,
+    /// so a write that leaves a row's values as they were still shows as a change.
+    fn stored(&mut self, table: &Table) -> Result<BTreeMap<String, String>> {
         // The case supplies the table and row key at runtime.
         Ok(diesel::sql_query(format!(
             "SELECT CAST(t.{} AS TEXT) AS key, CAST(t.xmin AS TEXT) AS version FROM {} t",
-            identifier(&case.config.key),
-            identifier(&case.config.table)
+            identifier(&table.key),
+            identifier(&table.name)
         ))
         .load::<StoredRow>(&mut self.connection)?
         .into_iter()

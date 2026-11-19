@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 
 use crate::{
     Prepared,
-    case::{Caller, Case},
+    case::{Caller, Case, Table},
     postgres::{Database, JsonRow},
     rows::Row,
 };
@@ -114,10 +114,10 @@ impl Model {
         self.divergence.as_deref()
     }
 
-    /// Ask the emitted answer for `action` about the rows and columns `probe` names.
+    /// Ask the emitted answer for `action` on `table` about the rows and columns `probe` names.
     pub fn permits(
         &self,
-        case: &Case,
+        table: &Table,
         caller: &Caller,
         action: ActionStatement,
         probe: &Probe,
@@ -127,8 +127,8 @@ impl Model {
             .translation()
             .row_naming()
             .iter()
-            .find(|naming| naming.table.name() == case.config.table)
-            .context("Translation has no row naming for the case table")?;
+            .find(|naming| naming.table.name() == table.name)
+            .with_context(|| format!("Translation has no row naming for {}", table.name))?;
         let existing = match probe.existing {
             Some(row) => Some(
                 naming
@@ -407,13 +407,14 @@ mod tests {
         let read = |case: &Case| Probe {
             existing: Some(&row),
             resulting: None,
-            columns: case.read_columns(),
+            columns: case.config.tables[0].read_columns(),
         };
-        assert!(model.permits(&case, caller, select, &read(&case))?);
-        assert!(!model.permits(&case, &case.config.callers[1], select, &read(&case))?);
-        case.config.columns.push("body".into());
+        let table = &case.config.tables[0];
+        assert!(model.permits(table, caller, select, &read(&case))?);
+        assert!(!model.permits(table, &case.config.callers[1], select, &read(&case))?);
+        case.config.tables[0].columns.push("body".into());
         let probe = read(&case);
-        assert!(!model.permits(&case, caller, select, &probe)?);
+        assert!(!model.permits(&case.config.tables[0], caller, select, &probe)?);
         assert!(model.answer(&ActionAnswer::Unrestricted, Some("docs:1"), &probe, caller)?);
         assert!(!model.answer(&ActionAnswer::Denied, Some("docs:1"), &probe, caller)?);
         let resulting = ActionAnswer::Judged(vec![rls2fga::types::ActionJudgement::new(
@@ -471,7 +472,12 @@ mod tests {
         };
         assert!(
             model
-                .permits(&case, &case.config.callers[0], select, &read(&case))
+                .permits(
+                    &case.config.tables[0],
+                    &case.config.callers[0],
+                    select,
+                    &read(&case)
+                )
                 .is_err()
         );
         Ok(())

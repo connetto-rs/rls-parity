@@ -1,4 +1,5 @@
-table = "docs"
+[[tables]]
+name = "docs"
 key = "id"
 columns = ["id"]
 
