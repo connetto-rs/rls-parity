@@ -6,13 +6,15 @@ Compare PostgreSQL row visibility with the SQLite replica from `pg2sqlite` and t
 
 ## Cases
 
-Each directory in `cases/` contains standalone `schema.sql`, `seed.sql` and `callers.toml`. The latter declares `table`, `key`, `columns`, and `[[callers]]` with `name`, `role`, and `settings` containing `app.user_id` and `app.subjects`. All callers use the declared reader role, with text identity and comma-delimited subjects.
+Each directory in `cases/` contains standalone `schema.sql`, `seed.sql` and `callers.toml`. The latter declares `table`, `key`, `columns`, and `[[callers]]` with `name`, `role`, and `settings` containing `app.user_id` and `app.subjects`. All callers use the declared reader role, with text identity and comma-delimited subjects. Every case measures `SELECT`, and a `[[writes]]` entry with `shape = "select_for_update"` also measures the locking read `SELECT ... FOR UPDATE`, which `OpenFGA` answers as its own action.
+
+The SQLite replica runs the statement as `pg2sqlite` translates it, so a clause the translation drops is dropped in the measurement too.
 
 `known.toml` identifies each discrepancy by `case`, `caller`, `row`, `statement`, `engine`, `direction` and `finding`. Directions are `wider`, `narrower`, `refused` and `error`. Unexpected discrepancies and entries that no longer occur fail the run.
 
 Engine errors count as discrepancies even when both engines reject the read. An absent replica table reports its SQLite error for every oracle row.
 
-Cases cover role inheritance, caller settings, grants, policy interactions, and table layouts. Only ordinary `SELECT` visibility is compared, including the read side of write and locking probes. Both `to_role_member` variants use the declared acting role.
+Cases cover role inheritance, caller settings, grants, policy interactions, and table layouts. `INSERT`, `UPDATE` and `DELETE` probes are measured through their read side only. Both `to_role_member` variants use the declared acting role.
 
 ## Run
 

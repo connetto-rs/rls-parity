@@ -91,8 +91,14 @@ impl Model {
         Ok(Prepared::Ready(model))
     }
 
-    /// Ask the emitted action answer for the emitted name of this row.
-    pub fn visible(&self, case: &Case, caller: &Caller, row: &Value) -> Result<bool> {
+    /// Ask the emitted answer for `action` about the emitted name of this row.
+    pub fn visible(
+        &self,
+        case: &Case,
+        caller: &Caller,
+        row: &Value,
+        action: ActionStatement,
+    ) -> Result<bool> {
         let naming = self
             .outputs
             .translation()
@@ -108,10 +114,8 @@ impl Model {
             .translation()
             .action_relations()
             .iter()
-            .find(|entry| {
-                entry.type_name == naming.type_name && entry.statement == ActionStatement::Select
-            })
-            .context("Translation has no SELECT answer")?;
+            .find(|entry| entry.type_name == naming.type_name && entry.statement == action)
+            .context(format!("Translation has no {action:?} answer"))?;
         self.answer(&entry.answer, &object, case, caller)
     }
 
@@ -129,7 +133,7 @@ impl Model {
             ActionAnswer::Judged(judgements) => {
                 for judgement in judgements {
                     if judgement.version != RowVersion::Existing {
-                        bail!("SELECT judges a resulting row");
+                        bail!("A read judges a resulting row");
                     }
                     if !self.check(judgement.relation.as_str(), object, caller)? {
                         return Ok(false);
@@ -143,7 +147,7 @@ impl Model {
                 }
                 for command in &columns.commands {
                     if command.command != ColumnCommand::Select {
-                        bail!("SELECT requires a non-SELECT column command");
+                        bail!("A read requires the {:?} column command", command.command);
                     }
                     for column in &case.config.columns {
                         let column = rls2fga::types::ColumnName::from_stored(column);
@@ -330,10 +334,11 @@ mod tests {
         };
         let row = json!({"id":1,"owner":"alice","body":"a"});
         let caller = &case.config.callers[0];
-        assert!(model.visible(&case, caller, &row)?);
-        assert!(!model.visible(&case, &case.config.callers[1], &row)?);
+        let select = ActionStatement::Select;
+        assert!(model.visible(&case, caller, &row, select)?);
+        assert!(!model.visible(&case, &case.config.callers[1], &row, select)?);
         case.config.columns.push("body".into());
-        assert!(!model.visible(&case, caller, &row)?);
+        assert!(!model.visible(&case, caller, &row, select)?);
         assert!(model.answer(&ActionAnswer::Unrestricted, "docs:1", &case, caller)?);
         assert!(!model.answer(&ActionAnswer::Denied, "docs:1", &case, caller)?);
         let resulting = ActionAnswer::Judged(vec![rls2fga::types::ActionJudgement::new(
@@ -374,7 +379,11 @@ mod tests {
         let Prepared::Ready(model) = Model::create(&openfga_url, &case, &mut database)? else {
             panic!("missing row key is an emitted gap");
         };
-        assert!(model.visible(&case, &case.config.callers[0], &row).is_err());
+        assert!(
+            model
+                .visible(&case, &case.config.callers[0], &row, select)
+                .is_err()
+        );
         Ok(())
     }
 }

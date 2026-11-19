@@ -13,6 +13,7 @@ use diesel::{
     sql_types::{Bool, Text},
 };
 use pg2sqlite::prelude::*;
+use sql_traits::structs::ParserDB;
 use sqlparser::ast::{Ident, ObjectName, Statement, TableObject};
 
 use crate::{
@@ -37,6 +38,8 @@ extern "SQL" {
 pub(crate) struct Replica {
     connection: SqliteConnection,
     session: Arc<Session>,
+    schema: ParserDB,
+    options: Pg2SqliteOptions,
 }
 
 impl Replica {
@@ -135,30 +138,54 @@ impl Replica {
         Ok(Prepared::Ready(Self {
             connection,
             session,
+            schema,
+            options,
         }))
     }
 
-    /// Read the same projection with the caller's session functions.
-    pub fn visible(&mut self, case: &Case, caller: usize) -> Result<BTreeSet<String>> {
+    /// Run pg2sqlite's own translation of `statement` with the caller's session functions.
+    pub fn visible(
+        &mut self,
+        case: &Case,
+        caller: usize,
+        statement: &str,
+    ) -> Result<Prepared<BTreeSet<String>>> {
         anyhow::ensure!(
             caller < self.session.callers.len(),
             "Caller index is outside the case"
         );
+        let translated = match Pg2Sqlite::default()
+            .sql(statement)
+            .and_then(|source| source.translate_with_schema(&self.schema, &self.options))
+        {
+            Ok(script) => script,
+            Err(error) => return Ok(Prepared::Refused(error.to_string())),
+        };
+        let mut queries = translated
+            .into_vec()
+            .into_iter()
+            .filter(|statement| matches!(statement, Statement::Query(_)));
+        let query = queries
+            .next()
+            .filter(|_| queries.next().is_none())
+            .with_context(|| format!("{statement} did not translate to one query"))?;
         self.session.caller.store(caller, Ordering::Relaxed);
-        // The case supplies the projection and row key at runtime.
+        // The case supplies the statement and row key at runtime.
         let rows = diesel::sql_query(format!(
-            "SELECT CAST({} AS TEXT) AS key FROM ({}) q",
+            "SELECT CAST({} AS TEXT) AS key FROM ({query}) q",
             identifier(&case.config.key),
-            case.statement()
         ))
         .load::<KeyRow>(&mut self.connection)?;
-        Ok(rows.into_iter().map(|row| row.key).collect())
+        Ok(Prepared::Ready(
+            rows.into_iter().map(|row| row.key).collect(),
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::case::Shape;
     use std::path::Path;
 
     /// Registered session functions follow the caller and leave writes unexempted.
@@ -172,8 +199,9 @@ mod tests {
         let Prepared::Ready(mut replica) = Replica::create(&case)? else {
             panic!("ownership fixture must translate");
         };
+        let select = case.statement(Shape::Select);
         for (index, caller) in case.config.callers.iter().enumerate() {
-            replica.visible(&case, index)?;
+            replica.visible(&case, index, &select)?;
             let actual = diesel::select((current_app_user(), current_subjects(), write_exempt()))
                 .get_result::<(String, String, bool)>(&mut replica.connection)?;
             assert_eq!(
@@ -186,9 +214,17 @@ mod tests {
             );
         }
         let error = replica
-            .visible(&case, case.config.callers.len())
+            .visible(&case, case.config.callers.len(), &select)
             .expect_err("invalid caller");
         assert!(error.to_string().contains("outside the case"));
+        assert!(matches!(
+            replica.visible(&case, 0, "INVALID SQL")?,
+            Prepared::Refused(_)
+        ));
+        let error = replica
+            .visible(&case, 0, "DELETE FROM docs")
+            .expect_err("a write is not a measured read");
+        assert!(error.to_string().contains("one query"), "{error}");
         case.schema = "INVALID SQL".into();
         assert!(matches!(Replica::create(&case)?, Prepared::Refused(_)));
         Ok(())

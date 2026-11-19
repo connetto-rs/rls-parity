@@ -11,6 +11,7 @@ pub use runner::{RunError, observe_cases, read_known};
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug)]
 pub(crate) enum Prepared<T> {
     Ready(T),
     Refused(String),

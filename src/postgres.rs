@@ -125,8 +125,13 @@ impl Database {
         )
     }
 
-    /// Read the case projection under the caller's role and settings.
-    pub fn visible(&mut self, case: &Case, caller: &Caller) -> Result<BTreeSet<String>> {
+    /// Run `statement` under the caller's role and settings and collect the row keys it returns.
+    pub fn visible(
+        &mut self,
+        case: &Case,
+        caller: &Caller,
+        statement: &str,
+    ) -> Result<BTreeSet<String>> {
         self.connection.batch_execute("BEGIN")?;
         let result = (|| {
             self.connection
@@ -135,11 +140,10 @@ impl Database {
                 diesel::select(set_config(name, value, true))
                     .get_result::<String>(&mut self.connection)?;
             }
-            // The case's projection and row key are runtime fixture data.
+            // The case's statement and row key are runtime fixture data.
             let rows = diesel::sql_query(format!(
-                "SELECT CAST({} AS TEXT) AS key FROM ({}) q",
+                "SELECT CAST({} AS TEXT) AS key FROM ({statement}) q",
                 identifier(&case.config.key),
-                case.statement()
             ))
             .load::<KeyRow>(&mut self.connection)?;
             Ok(rows.into_iter().map(|row| row.key).collect())

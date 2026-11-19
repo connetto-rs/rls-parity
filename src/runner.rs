@@ -112,39 +112,52 @@ fn run_case(path: &Path, database_url: &str, openfga_url: &str) -> Result<Vec<Ob
     let model = Model::create(openfga_url, &case, &mut database)
         .with_context(|| format!("Loading OpenFGA for {}", case.name))?;
     let mut observations = Vec::new();
-    for (caller_index, caller) in case.config.callers.iter().enumerate() {
-        let postgres = database.visible(&case, caller);
-        let sqlite = match &mut replica {
-            Prepared::Ready(replica) => Ok(replica.visible(&case, caller_index)),
-            Prepared::Refused(reason) => Err(reason.as_str()),
-        };
-        for row in &rows {
-            let key = row.get(&case.config.key).context("Seeded row has no key")?;
-            let key = match key {
-                Value::String(key) => Cow::Borrowed(key.as_str()),
-                other => Cow::Owned(other.to_string()),
+    let shapes: Vec<_> = case.shapes().collect();
+    for shape in shapes {
+        let statement = case.statement(shape);
+        for (caller_index, caller) in case.config.callers.iter().enumerate() {
+            let postgres = database.visible(&case, caller, &statement);
+            // The outer error is a refusal and the inner one an execution failure.
+            let sqlite = match &mut replica {
+                Prepared::Ready(replica) => {
+                    match replica.visible(&case, caller_index, &statement) {
+                        Ok(Prepared::Ready(keys)) => Ok(Ok(keys)),
+                        Ok(Prepared::Refused(reason)) => Err(reason),
+                        Err(error) => Ok(Err(error)),
+                    }
+                }
+                Prepared::Refused(reason) => Err(reason.clone()),
             };
-            let sqlite_answer = match &sqlite {
-                Err(reason) => Answer::Refused((*reason).to_owned()),
-                Ok(answer) => visibility(answer, &key),
-            };
-            let openfga_answer = match &model {
-                Prepared::Refused(reason) => Answer::Refused(reason.clone()),
-                Prepared::Ready(model) => match model.visible(&case, caller, row) {
-                    Ok(true) => Answer::Visible,
-                    Ok(false) => Answer::Hidden,
-                    Err(error) => Answer::Error(format!("{error:#}")),
-                },
-            };
-            observations.push(Observation {
-                case: case.name.clone(),
-                caller: caller.name.clone(),
-                row: format!("{}:{key}", case.config.table),
-                statement: case.statement(),
-                postgres: visibility(&postgres, &key),
-                sqlite: sqlite_answer,
-                openfga: openfga_answer,
-            });
+            for row in &rows {
+                let key = row.get(&case.config.key).context("Seeded row has no key")?;
+                let key = match key {
+                    Value::String(key) => Cow::Borrowed(key.as_str()),
+                    other => Cow::Owned(other.to_string()),
+                };
+                let sqlite_answer = match &sqlite {
+                    Err(reason) => Answer::Refused(reason.clone()),
+                    Ok(answer) => visibility(answer, &key),
+                };
+                let openfga_answer = match &model {
+                    Prepared::Refused(reason) => Answer::Refused(reason.clone()),
+                    Prepared::Ready(model) => {
+                        match model.visible(&case, caller, row, shape.action()) {
+                            Ok(true) => Answer::Visible,
+                            Ok(false) => Answer::Hidden,
+                            Err(error) => Answer::Error(format!("{error:#}")),
+                        }
+                    }
+                };
+                observations.push(Observation {
+                    case: case.name.clone(),
+                    caller: caller.name.clone(),
+                    row: format!("{}:{key}", case.config.table),
+                    statement: statement.clone(),
+                    postgres: visibility(&postgres, &key),
+                    sqlite: sqlite_answer,
+                    openfga: openfga_answer,
+                });
+            }
         }
     }
     if let Prepared::Ready(mut model) = model {
