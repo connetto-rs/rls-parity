@@ -13,7 +13,7 @@ publish = false
 anyhow = "1"
 diesel = { version = "2.3", features = ["postgres", "sqlite", "serde_json"] }
 libsqlite3-sys = { version = "0.38", features = ["bundled"] }
-pg2sqlite = { git = "https://github.com/connetto-rs/pg2sqlite", branch = "main" }
+pg2sqlite = { git = "https://github.com/connetto-rs/pg2sqlite", branch = "main", features = ["diesel"] }
 rls2fga = { git = "https://github.com/connetto-rs/rls2fga", branch = "main", features = ["client"] }
 sql-traits = { git = "https://github.com/connetto-rs/sql-traits", branch = "main" }
 sqlparser = "0.64"

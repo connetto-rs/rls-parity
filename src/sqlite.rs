@@ -42,6 +42,7 @@ pub(crate) struct Replica {
 impl Replica {
     /// Load the emitted script and seed its published physical tables.
     pub fn create(case: &Case) -> Result<Prepared<Self>> {
+        let jsonb = JsonbFunctions::new("jsonb_canonical", "jsonb_order");
         let options = Pg2SqliteOptions::default()
             .with_deployment(case.deployment()?)
             .with_acting_role(&case.config.callers[0].role)
@@ -49,6 +50,7 @@ impl Replica {
             .with_uuid_function_name("uuid_blob")
             .with_rls_audit_table_name("rls_audit".to_owned())
             .with_write_exemption_function("write_exempt")
+            .with_jsonb_functions(jsonb.clone())
             .with_session_variable(SessionVariableMapping::new(
                 "app.user_id",
                 "current_app_user",
@@ -67,6 +69,7 @@ impl Replica {
         };
         let manifest = translator.translation_manifest(&options)?;
         let mut connection = SqliteConnection::establish(":memory:")?;
+        jsonb.register(&mut connection)?;
         let session = Arc::new(Session {
             callers: case
                 .config

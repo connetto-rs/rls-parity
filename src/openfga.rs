@@ -285,7 +285,7 @@ fn tuple(record: &Record) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rls2fga::types::{ConditionName, RecordContextValue, RelationName};
+    use rls2fga::types::{ConditionName, RecordContextValue, RelationName, TypeName};
 
     /// Tuple serialization preserves emitted names and optional condition context.
     #[test]
@@ -339,6 +339,7 @@ mod tests {
         let resulting = ActionAnswer::Judged(vec![rls2fga::types::ActionJudgement::new(
             RelationName::canonicalized("owner"),
             RowVersion::Resulting,
+            TypeName::canonicalized("docs"),
         )]);
         assert!(model.answer(&resulting, "docs:1", &case, caller).is_err());
         let mut answer = model
