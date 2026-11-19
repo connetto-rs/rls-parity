@@ -68,6 +68,22 @@ pub struct Observation {
     pub openfga: Answer,
 }
 
+/// Each translator's verdict on a case's schema, `None` when it accepts and the refusal
+/// otherwise.
+#[derive(Debug, Serialize)]
+pub struct Acceptance {
+    pub case: String,
+    pub sqlite: Option<String>,
+    pub openfga: Option<String>,
+}
+
+/// Every live measurement of a suite.
+#[derive(Debug, Default)]
+pub struct Measurements {
+    pub acceptances: Vec<Acceptance>,
+    pub observations: Vec<Observation>,
+}
+
 /// The translated engine being compared.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -102,6 +118,26 @@ pub struct Known {
     pub finding: String,
 }
 
+/// A tracked case whose schema one translator refuses while the other accepts it, named by
+/// the refusing engine.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnownRefusal {
+    pub case: String,
+    pub engine: Engine,
+    pub finding: String,
+}
+
+/// Every tracked discrepancy, per row and per schema.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnownList {
+    #[serde(default)]
+    pub known: Vec<Known>,
+    #[serde(default)]
+    pub refusal: Vec<KnownRefusal>,
+}
+
 /// Classify an engine answer against the live oracle.
 fn direction(oracle: &Answer, actual: &Answer) -> Option<Direction> {
     if oracle == actual && !matches!(oracle, Answer::Error(_)) {
@@ -125,7 +161,47 @@ fn direction(oracle: &Answer, actual: &Answer) -> Option<Direction> {
 
 /// Report unexpected discrepancies and known discrepancies that disappeared.
 #[must_use]
-pub fn compare(observations: &[Observation], known: &[Known]) -> Vec<String> {
+pub fn compare(measurements: &Measurements, known: &KnownList) -> Vec<String> {
+    let mut errors = compare_rows(&measurements.observations, &known.known);
+    errors.extend(compare_acceptances(
+        &measurements.acceptances,
+        &known.refusal,
+    ));
+    errors
+}
+
+/// Report schemas exactly one translator refuses unless listed, and listed refusals that
+/// disappeared.
+fn compare_acceptances(acceptances: &[Acceptance], known: &[KnownRefusal]) -> Vec<String> {
+    let mut seen = vec![false; known.len()];
+    let mut errors = Vec::new();
+    for acceptance in acceptances {
+        let engine = match (&acceptance.sqlite, &acceptance.openfga) {
+            (Some(_), None) => Engine::Sqlite,
+            (None, Some(_)) => Engine::Openfga,
+            _ => continue,
+        };
+        match known
+            .iter()
+            .position(|entry| entry.case == acceptance.case && entry.engine == engine)
+        {
+            Some(index) => seen[index] = true,
+            None => errors.push(format!("Unlisted {engine:?} refusal {acceptance:?}")),
+        }
+    }
+    for (entry, seen) in known.iter().zip(seen) {
+        if !seen {
+            let witness = acceptances
+                .iter()
+                .find(|acceptance| acceptance.case == entry.case);
+            errors.push(format!("Stale known refusal {entry:?} witness={witness:?}"));
+        }
+    }
+    errors
+}
+
+/// Report row discrepancies missing from `known`, and entries of `known` no longer observed.
+fn compare_rows(observations: &[Observation], known: &[Known]) -> Vec<String> {
     let mut seen = vec![false; known.len()];
     let mut errors = Vec::new();
     for observation in observations {
@@ -191,13 +267,16 @@ mod tests {
             openfga: Answer::Visible,
         };
         assert_eq!(
-            compare(
+            compare_rows(
                 std::slice::from_ref(&observation),
                 std::slice::from_ref(&known)
             ),
             Vec::<String>::new()
         );
-        assert_eq!(compare(std::slice::from_ref(&observation), &[]).len(), 1);
+        assert_eq!(
+            compare_rows(std::slice::from_ref(&observation), &[]).len(),
+            1
+        );
         let mut unrelated = Observation {
             case: observation.case.clone(),
             caller: "bob".into(),
@@ -208,7 +287,7 @@ mod tests {
             openfga: Answer::Visible,
         };
         assert_eq!(
-            compare(
+            compare_rows(
                 std::slice::from_ref(&unrelated),
                 std::slice::from_ref(&known)
             )
@@ -218,14 +297,55 @@ mod tests {
         unrelated.postgres = Answer::Error("broken query".into());
         unrelated.sqlite = Answer::Error("broken query".into());
         unrelated.openfga = Answer::Error("broken query".into());
-        assert_eq!(compare(&[unrelated], &[]).len(), 2);
+        assert_eq!(compare_rows(&[unrelated], &[]).len(), 2);
         observation.sqlite = Answer::Visible;
-        let errors = compare(&[observation], &[known]);
+        let errors = compare_rows(&[observation], &[known]);
         assert_eq!(errors.len(), 1);
         for required in [
             "fixture", "alice", "docs:1", "SELECT", "postgres", "sqlite", "openfga",
         ] {
             assert!(errors[0].contains(required), "{required}");
+        }
+    }
+
+    /// A schema exactly one translator refuses fails unless listed for that engine, and a
+    /// listed refusal fails once both translators agree.
+    #[test]
+    fn refusal_parity() {
+        let listed = KnownList {
+            known: Vec::new(),
+            refusal: vec![KnownRefusal {
+                case: "fixture".into(),
+                engine: Engine::Sqlite,
+                finding: "test".into(),
+            }],
+        };
+        let measured = |sqlite: Option<&str>, openfga: Option<&str>| Measurements {
+            acceptances: vec![Acceptance {
+                case: "fixture".into(),
+                sqlite: sqlite.map(Into::into),
+                openfga: openfga.map(Into::into),
+            }],
+            observations: Vec::new(),
+        };
+        let refused_by_sqlite = measured(Some("partitioned"), None);
+        assert_eq!(compare(&refused_by_sqlite, &listed), Vec::<String>::new());
+        let errors = compare(&refused_by_sqlite, &KnownList::default());
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].contains("Unlisted Sqlite refusal"),
+            "{}",
+            errors[0]
+        );
+        assert!(errors[0].contains("partitioned"), "{}", errors[0]);
+        let errors = compare(&measured(None, Some("diverges")), &listed);
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(errors[0].contains("Unlisted Openfga refusal"));
+        assert!(errors[1].contains("Stale known refusal"));
+        for (sqlite, openfga) in [(None, None), (Some("one"), Some("other"))] {
+            let errors = compare(&measured(sqlite, openfga), &listed);
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert!(errors[0].contains("Stale known refusal"));
         }
     }
 

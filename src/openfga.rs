@@ -40,6 +40,8 @@ pub(crate) struct Model {
     store_url: String,
     id: String,
     outputs: Outputs,
+    /// Why connetto's gate, `Translation::outputs`, refuses the model, absent when it accepts.
+    divergence: Option<String>,
     cleaned: bool,
 }
 
@@ -61,6 +63,11 @@ impl Model {
         for note in translation.notes() {
             println!("{} OpenFGA note {note:?}", case.name);
         }
+        let divergence = translation
+            .clone()
+            .outputs()
+            .err()
+            .map(|error| error.to_string());
         let outputs = translation.outputs_accepting_gaps();
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
@@ -78,6 +85,7 @@ impl Model {
             store_url: format!("{url}/stores/{store_id}"),
             id: String::new(),
             outputs,
+            divergence,
             cleaned: false,
         };
         let created = request(
@@ -99,6 +107,11 @@ impl Model {
             )?;
         }
         Ok(Prepared::Ready(model))
+    }
+
+    /// Why `Translation::outputs` refuses the model, absent when it accepts.
+    pub fn divergence(&self) -> Option<&str> {
+        self.divergence.as_deref()
     }
 
     /// Ask the emitted answer for `action` about the rows and columns `probe` names.

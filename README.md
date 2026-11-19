@@ -12,9 +12,11 @@ An `update` or `delete` probe runs once per seeded row, filtered by its key, whi
 
 The SQLite replica runs the statement as `pg2sqlite` translates it, so a clause the translation drops is dropped in the measurement too.
 
-`known.toml` identifies each discrepancy by `case`, `caller`, `row`, `statement`, `engine`, `direction` and `finding`. Directions are `wider`, `narrower`, `different_denial`, `refused` and `error`. `different_denial` marks a write both engines refuse, one by skipping the row and the other by aborting, or with different SQLSTATEs. Unexpected discrepancies and entries that no longer occur fail the run.
+A `[[known]]` entry in `known.toml` identifies each row discrepancy by `case`, `caller`, `row`, `statement`, `engine`, `direction` and `finding`. Directions are `wider`, `narrower`, `different_denial`, `refused` and `error`. `different_denial` marks a write both engines refuse, one by skipping the row and the other by aborting, or with different SQLSTATEs. Unexpected discrepancies and entries that no longer occur fail the run.
 
 Engine errors count as discrepancies even when both engines reject the read. An absent replica table reports its SQLite error for every oracle row.
+
+Each case also records whether each translator accepts its schema, the way connetto gates it. `pg2sqlite` accepts when it translates the schema. `rls2fga` accepts when `Translation::outputs` succeeds, so a note that diverges from the database refuses it, while row comparisons keep running on `outputs_accepting_gaps`. A schema exactly one of them refuses is a discrepancy unless a `[[refusal]]` entry in `known.toml` lists its `case`, the refusing `engine` and the `finding`.
 
 Cases cover role inheritance, caller settings, grants, policy interactions, writes, and table layouts. Both `to_role_member` variants use the declared acting role.
 

@@ -1,7 +1,7 @@
 use std::{env, io::Write, path::Path};
 
 use anyhow::{Context, Result, bail, ensure};
-use rls_parity::{Known, Observation, compare, observe_cases, read_known};
+use rls_parity::{KnownList, Measurements, compare, observe_cases, read_known};
 
 /// Compare every case against a live PostgreSQL oracle.
 fn main() -> Result<()> {
@@ -11,9 +11,9 @@ fn main() -> Result<()> {
     let database_url = env::var("DATABASE_URL")
         .context("Set DATABASE_URL to a dedicated PostgreSQL 18 cluster")?;
     let openfga_url = env::var("OPENFGA_URL").context("Set OPENFGA_URL to OpenFGA v1.11.6")?;
-    let observations = observe_cases(Path::new("cases"), &database_url, &openfga_url)?;
+    let measurements = observe_cases(Path::new("cases"), &database_url, &openfga_url)?;
     report(
-        &observations,
+        &measurements,
         &known,
         std::io::stdout().lock(),
         std::io::stderr().lock(),
@@ -29,15 +29,19 @@ fn known_path(args: &[String]) -> Result<&Path> {
     }
 }
 
-/// Emit every observation and fail after emitting every comparison diagnostic.
+/// Emit every measurement and fail after emitting every comparison diagnostic.
 fn report(
-    observations: &[Observation],
-    known: &[Known],
+    measurements: &Measurements,
+    known: &KnownList,
     mut stdout: impl Write,
     mut stderr: impl Write,
 ) -> Result<()> {
-    let errors = compare(observations, known);
-    for observation in observations {
+    let errors = compare(measurements, known);
+    for acceptance in &measurements.acceptances {
+        serde_json::to_writer(&mut stdout, acceptance)?;
+        writeln!(stdout)?;
+    }
+    for observation in &measurements.observations {
         serde_json::to_writer(&mut stdout, observation)?;
         writeln!(stdout)?;
     }
@@ -47,8 +51,9 @@ fn report(
     ensure!(errors.is_empty(), "{} parity failures", errors.len());
     writeln!(
         stdout,
-        "Compared {} caller-row statements across three engines",
-        observations.len()
+        "Compared {} schemas and {} caller-row statements across three engines",
+        measurements.acceptances.len(),
+        measurements.observations.len()
     )?;
     Ok(())
 }
@@ -56,7 +61,7 @@ fn report(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rls_parity::Answer;
+    use rls_parity::{Answer, Observation};
 
     /// Argument parsing accepts only an optional known-list path.
     #[test]
@@ -78,32 +83,31 @@ mod tests {
     /// Report output retains the full witness when a comparison fails.
     #[test]
     fn discrepancy_report() {
-        let observation = Observation {
-            case: "fixture".into(),
-            caller: "alice".into(),
-            row: "docs:1".into(),
-            statement: "SELECT id FROM docs".into(),
-            postgres: Answer::Visible,
-            sqlite: Answer::Hidden,
-            openfga: Answer::Visible,
+        let measurements = Measurements {
+            acceptances: Vec::new(),
+            observations: vec![Observation {
+                case: "fixture".into(),
+                caller: "alice".into(),
+                row: "docs:1".into(),
+                statement: "SELECT id FROM docs".into(),
+                postgres: Answer::Visible,
+                sqlite: Answer::Hidden,
+                openfga: Answer::Visible,
+            }],
         };
+        let known = KnownList::default();
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let error = report(
-            std::slice::from_ref(&observation),
-            &[],
-            &mut stdout,
-            &mut stderr,
-        )
-        .expect_err("unlisted divergence");
+        let error = report(&measurements, &known, &mut stdout, &mut stderr)
+            .expect_err("unlisted divergence");
         assert_eq!(error.to_string(), "1 parity failures");
         assert_eq!(
             String::from_utf8(stderr).unwrap(),
-            format!("{}\n", compare(std::slice::from_ref(&observation), &[])[0])
+            format!("{}\n", compare(&measurements, &known)[0])
         );
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&stdout).unwrap(),
-            serde_json::to_value(observation).unwrap()
+            serde_json::to_value(&measurements.observations[0]).unwrap()
         );
     }
 }

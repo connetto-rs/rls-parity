@@ -5,11 +5,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
-    Answer, Known, Observation, Outcome, Prepared,
+    Acceptance, Answer, KnownList, Measurements, Observation, Outcome, Prepared,
     case::{Case, Shape, Write, identifier, key_text},
     openfga::{Model, Probe},
     postgres::Database,
@@ -41,26 +40,19 @@ pub enum RunError {
     },
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct KnownFile {
-    known: Vec<Known>,
-}
-
 /// Read the exact known-discrepancy list.
 ///
 /// # Errors
 /// Returns the path and cause when the file cannot be read or decoded.
-pub fn read_known(path: &Path) -> std::result::Result<Vec<Known>, RunError> {
+pub fn read_known(path: &Path) -> std::result::Result<KnownList, RunError> {
     let text = fs::read_to_string(path).map_err(|source| RunError::Io {
         path: path.into(),
         source,
     })?;
-    let file: KnownFile = toml::from_str(&text).map_err(|source| RunError::InvalidKnown {
+    toml::from_str(&text).map_err(|source| RunError::InvalidKnown {
         path: path.into(),
         source,
-    })?;
-    Ok(file.known)
+    })
 }
 
 /// Collect live three-engine observations independently of the known list.
@@ -71,7 +63,7 @@ pub fn observe_cases(
     root: &Path,
     database_url: &str,
     openfga_url: &str,
-) -> std::result::Result<Vec<Observation>, RunError> {
+) -> std::result::Result<Measurements, RunError> {
     let directories = fs::read_dir(root)
         .and_then(|entries| {
             entries
@@ -87,20 +79,26 @@ pub fn observe_cases(
     }
     let mut directories = directories;
     directories.sort();
-    let mut observations = Vec::new();
+    let mut measurements = Measurements::default();
     for directory in directories {
-        observations.extend(
+        let (acceptance, observations) =
             run_case(&directory, database_url, openfga_url).map_err(|source| RunError::Case {
                 path: directory,
                 source,
-            })?,
-        );
+            })?;
+        measurements.acceptances.push(acceptance);
+        measurements.observations.extend(observations);
     }
-    Ok(observations)
+    Ok(measurements)
 }
 
-/// Measure every caller and seeded row before evaluating the known list.
-fn run_case(path: &Path, database_url: &str, openfga_url: &str) -> Result<Vec<Observation>> {
+/// Measure whether each translator accepts the schema, then every caller and seeded row,
+/// before evaluating the known list.
+fn run_case(
+    path: &Path,
+    database_url: &str,
+    openfga_url: &str,
+) -> Result<(Acceptance, Vec<Observation>)> {
     let case = Case::read(path)?;
     let mut database =
         Database::create(database_url, &case).with_context(|| format!("Creating {}", case.name))?;
@@ -110,6 +108,7 @@ fn run_case(path: &Path, database_url: &str, openfga_url: &str) -> Result<Vec<Ob
         Replica::create(&case).with_context(|| format!("Loading SQLite for {}", case.name))?;
     let model = Model::create(openfga_url, &case, &mut database)
         .with_context(|| format!("Loading OpenFGA for {}", case.name))?;
+    let acceptance = acceptance(&case, &replica, &model);
     let mut observations = Vec::new();
     let read_columns = case.read_columns();
     let shapes: Vec<_> = case.shapes().collect();
@@ -199,7 +198,22 @@ fn run_case(path: &Path, database_url: &str, openfga_url: &str) -> Result<Vec<Ob
         model.cleanup()?;
     }
     database.cleanup()?;
-    Ok(observations)
+    Ok((acceptance, observations))
+}
+
+/// Each translator's verdict on the case's schema, the way connetto gates it.
+fn acceptance(case: &Case, replica: &Prepared<Replica>, model: &Prepared<Model>) -> Acceptance {
+    Acceptance {
+        case: case.name.clone(),
+        sqlite: match replica {
+            Prepared::Ready(_) => None,
+            Prepared::Refused(reason) => Some(reason.clone()),
+        },
+        openfga: match model {
+            Prepared::Ready(model) => model.divergence().map(ToOwned::to_owned),
+            Prepared::Refused(reason) => Some(reason.clone()),
+        },
+    }
 }
 
 /// One write statement a caller runs and the rows it answers for.
