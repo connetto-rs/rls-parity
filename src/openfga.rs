@@ -25,6 +25,16 @@ use crate::{
     rows::Row,
 };
 
+/// The rows and columns one check about one statement names.
+pub(crate) struct Probe<'a> {
+    /// The stored row the statement reaches, absent for an insert.
+    pub existing: Option<&'a Value>,
+    /// The row the statement produces, absent for a read or a delete.
+    pub resulting: Option<&'a Value>,
+    /// The columns the statement touches under each column command.
+    pub columns: BTreeMap<ColumnCommand, Vec<String>>,
+}
+
 pub(crate) struct Model {
     client: Client,
     store_url: String,
@@ -91,13 +101,13 @@ impl Model {
         Ok(Prepared::Ready(model))
     }
 
-    /// Ask the emitted answer for `action` about the emitted name of this row.
-    pub fn visible(
+    /// Ask the emitted answer for `action` about the rows and columns `probe` names.
+    pub fn permits(
         &self,
         case: &Case,
         caller: &Caller,
-        row: &Value,
         action: ActionStatement,
+        probe: &Probe,
     ) -> Result<bool> {
         let naming = self
             .outputs
@@ -106,9 +116,14 @@ impl Model {
             .iter()
             .find(|naming| naming.table.name() == case.config.table)
             .context("Translation has no row naming for the case table")?;
-        let object = naming
-            .render(&Row(row))?
-            .context("Row has no OpenFGA object name")?;
+        let existing = match probe.existing {
+            Some(row) => Some(
+                naming
+                    .render(&Row(row))?
+                    .context("Row has no OpenFGA object name")?,
+            ),
+            None => None,
+        };
         let entry = self
             .outputs
             .translation()
@@ -116,15 +131,15 @@ impl Model {
             .iter()
             .find(|entry| entry.type_name == naming.type_name && entry.statement == action)
             .context(format!("Translation has no {action:?} answer"))?;
-        self.answer(&entry.answer, &object, case, caller)
+        self.answer(&entry.answer, existing.as_deref(), probe, caller)
     }
 
     /// Interpret the translation's action answer without inferring relations.
     fn answer(
         &self,
         answer: &ActionAnswer,
-        object: &str,
-        case: &Case,
+        existing: Option<&str>,
+        probe: &Probe,
         caller: &Caller,
     ) -> Result<bool> {
         match answer {
@@ -132,26 +147,54 @@ impl Model {
             ActionAnswer::Denied => Ok(false),
             ActionAnswer::Judged(judgements) => {
                 for judgement in judgements {
-                    if judgement.version != RowVersion::Existing {
-                        bail!("A read judges a resulting row");
-                    }
-                    if !self.check(judgement.relation.as_str(), object, caller)? {
+                    let relation = judgement.relation.as_str();
+                    let granted = match judgement.version {
+                        RowVersion::Existing => {
+                            let object = existing.context("The statement reaches no stored row")?;
+                            self.check(relation, object, caller, &[])?
+                        }
+                        RowVersion::Resulting => {
+                            let row = probe
+                                .resulting
+                                .context("The statement produces no resulting row")?;
+                            let resulting = self
+                                .outputs
+                                .translation()
+                                .resulting_rows()
+                                .iter()
+                                .find(|resulting| resulting.type_name == judgement.type_name)
+                                .context("Translation names no resulting row for the judgement")?;
+                            let object = resulting
+                                .object(&Row(row))?
+                                .context("Resulting row has no OpenFGA object name")?;
+                            let records: Vec<Value> =
+                                resulting.records(&Row(row))?.iter().map(tuple).collect();
+                            self.check(relation, &object, caller, &records)?
+                        }
+                        other => bail!("Unsupported row version {other:?}"),
+                    };
+                    if !granted {
                         return Ok(false);
                     }
                 }
                 Ok(true)
             }
             ActionAnswer::ByColumn(columns) => {
-                if !self.answer(&columns.rows, object, case, caller)? {
+                if !self.answer(&columns.rows, existing, probe, caller)? {
                     return Ok(false);
                 }
                 for command in &columns.commands {
-                    if command.command != ColumnCommand::Select {
-                        bail!("A read requires the {:?} column command", command.command);
-                    }
-                    for column in &case.config.columns {
+                    let touched = probe.columns.get(&command.command).with_context(|| {
+                        format!("The statement touches no {:?} columns", command.command)
+                    })?;
+                    for column in touched {
                         let column = rls2fga::types::ColumnName::from_stored(column);
-                        if !self.check(command.relation(&column).as_str(), &columns.gate, caller)? {
+                        if !self.check(
+                            command.relation(&column).as_str(),
+                            &columns.gate,
+                            caller,
+                            &[],
+                        )? {
                             return Ok(false);
                         }
                     }
@@ -162,20 +205,33 @@ impl Model {
         }
     }
 
-    /// Carry the acting role as a contextual tuple on every check.
-    fn check(&self, relation: &str, object: &str, caller: &Caller) -> Result<bool> {
+    /// Carry the acting role and `records` as contextual tuples on the check.
+    fn check(
+        &self,
+        relation: &str,
+        object: &str,
+        caller: &Caller,
+        records: &[Value],
+    ) -> Result<bool> {
         let user = format!("user:{}", caller.settings["app.user_id"]);
         let subjects: Vec<&str> = caller.settings["app.subjects"]
             .split(',')
             .filter(|item| !item.is_empty())
             .collect();
-        let result = self.post("check", &json!({
-            "authorization_model_id":self.id,
-            "tuple_key":{"user":user,"relation":relation,"object":object},
-            "contextual_tuples":{"tuple_keys":[{"user":user,"relation":"usage","object":format!("pg_role:{}",caller.role)}]},
-            "context":{"settings":caller.settings,"app_subjects":subjects},
-            "consistency":"HIGHER_CONSISTENCY"
-        }))?;
+        let mut contextual = vec![
+            json!({"user":user,"relation":"usage","object":format!("pg_role:{}",caller.role)}),
+        ];
+        contextual.extend_from_slice(records);
+        let result = self.post(
+            "check",
+            &json!({
+                "authorization_model_id":self.id,
+                "tuple_key":{"user":user,"relation":relation,"object":object},
+                "contextual_tuples":{"tuple_keys":contextual},
+                "context":{"settings":caller.settings,"app_subjects":subjects},
+                "consistency":"HIGHER_CONSISTENCY"
+            }),
+        )?;
         result["allowed"]
             .as_bool()
             .context("Check response has no allowed answer")
@@ -335,18 +391,36 @@ mod tests {
         let row = json!({"id":1,"owner":"alice","body":"a"});
         let caller = &case.config.callers[0];
         let select = ActionStatement::Select;
-        assert!(model.visible(&case, caller, &row, select)?);
-        assert!(!model.visible(&case, &case.config.callers[1], &row, select)?);
+        let read = |case: &Case| Probe {
+            existing: Some(&row),
+            resulting: None,
+            columns: case.read_columns(),
+        };
+        assert!(model.permits(&case, caller, select, &read(&case))?);
+        assert!(!model.permits(&case, &case.config.callers[1], select, &read(&case))?);
         case.config.columns.push("body".into());
-        assert!(!model.visible(&case, caller, &row, select)?);
-        assert!(model.answer(&ActionAnswer::Unrestricted, "docs:1", &case, caller)?);
-        assert!(!model.answer(&ActionAnswer::Denied, "docs:1", &case, caller)?);
+        let probe = read(&case);
+        assert!(!model.permits(&case, caller, select, &probe)?);
+        assert!(model.answer(&ActionAnswer::Unrestricted, Some("docs:1"), &probe, caller)?);
+        assert!(!model.answer(&ActionAnswer::Denied, Some("docs:1"), &probe, caller)?);
         let resulting = ActionAnswer::Judged(vec![rls2fga::types::ActionJudgement::new(
             RelationName::canonicalized("owner"),
             RowVersion::Resulting,
             TypeName::canonicalized("docs"),
         )]);
-        assert!(model.answer(&resulting, "docs:1", &case, caller).is_err());
+        let error = model
+            .answer(&resulting, Some("docs:1"), &probe, caller)
+            .expect_err("a read produces no resulting row");
+        assert!(error.to_string().contains("no resulting row"), "{error}");
+        let existing = ActionAnswer::Judged(vec![rls2fga::types::ActionJudgement::new(
+            RelationName::canonicalized("owner"),
+            RowVersion::Existing,
+            TypeName::canonicalized("docs"),
+        )]);
+        let error = model
+            .answer(&existing, None, &probe, caller)
+            .expect_err("an insert reaches no stored row");
+        assert!(error.to_string().contains("no stored row"), "{error}");
         let mut answer = model
             .outputs
             .translation()
@@ -364,7 +438,10 @@ mod tests {
             .first_mut()
             .context("column command")?
             .command = ColumnCommand::Insert;
-        assert!(model.answer(&answer, "docs:1", &case, caller).is_err());
+        let error = model
+            .answer(&answer, Some("docs:1"), &probe, caller)
+            .expect_err("a read touches no inserted column");
+        assert!(error.to_string().contains("Insert"), "{error}");
         let error = model
             .post("check", &json!({}))
             .expect_err("incomplete check");
@@ -381,7 +458,7 @@ mod tests {
         };
         assert!(
             model
-                .visible(&case, &case.config.callers[0], &row, select)
+                .permits(&case, &case.config.callers[0], select, &read(&case))
                 .is_err()
         );
         Ok(())

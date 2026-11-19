@@ -10,6 +10,7 @@ use anyhow::{Context, Result, anyhow};
 use diesel::{
     connection::SimpleConnection,
     prelude::*,
+    result::Error as DieselError,
     sql_types::{Bool, Text},
 };
 use pg2sqlite::prelude::*;
@@ -17,7 +18,7 @@ use sql_traits::structs::ParserDB;
 use sqlparser::ast::{Ident, ObjectName, Statement, TableObject};
 
 use crate::{
-    Prepared,
+    Outcome, Prepared,
     case::{Case, identifier},
     postgres::KeyRow,
 };
@@ -135,6 +136,12 @@ impl Replica {
                 .with_context(|| format!("Seeding {statement}"))?;
         }
         session.exempt.store(false, Ordering::Relaxed);
+        // The physical table is known only once pg2sqlite has translated the case.
+        let physical = manifest
+            .iter()
+            .find(|entry| entry.logical == case.config.table)
+            .map(|entry| entry.physical.as_str());
+        track_changes(&mut connection, physical, &case.config.key)?;
         Ok(Prepared::Ready(Self {
             connection,
             session,
@@ -150,26 +157,17 @@ impl Replica {
         caller: usize,
         statement: &str,
     ) -> Result<Prepared<BTreeSet<String>>> {
-        anyhow::ensure!(
-            caller < self.session.callers.len(),
-            "Caller index is outside the case"
-        );
-        let translated = match Pg2Sqlite::default()
-            .sql(statement)
-            .and_then(|source| source.translate_with_schema(&self.schema, &self.options))
-        {
-            Ok(script) => script,
-            Err(error) => return Ok(Prepared::Refused(error.to_string())),
+        let translated = match self.translate(caller, statement)? {
+            Prepared::Ready(translated) => translated,
+            Prepared::Refused(reason) => return Ok(Prepared::Refused(reason)),
         };
         let mut queries = translated
-            .into_vec()
             .into_iter()
             .filter(|statement| matches!(statement, Statement::Query(_)));
         let query = queries
             .next()
             .filter(|_| queries.next().is_none())
             .with_context(|| format!("{statement} did not translate to one query"))?;
-        self.session.caller.store(caller, Ordering::Relaxed);
         // The case supplies the statement and row key at runtime.
         let rows = diesel::sql_query(format!(
             "SELECT CAST({} AS TEXT) AS key FROM ({query}) q",
@@ -180,6 +178,80 @@ impl Replica {
             rows.into_iter().map(|row| row.key).collect(),
         ))
     }
+
+    /// Run pg2sqlite's translation of the write `statement` as the caller, rolled back.
+    pub fn write(&mut self, caller: usize, statement: &str) -> Result<Prepared<Outcome>> {
+        let translated = match self.translate(caller, statement)? {
+            Prepared::Ready(translated) => translated,
+            Prepared::Refused(reason) => return Ok(Prepared::Refused(reason)),
+        };
+        self.connection.batch_execute("SAVEPOINT probe")?;
+        let result = (|| {
+            for statement in &translated {
+                // The case's write is runtime fixture data, as pg2sqlite translated it.
+                if let Err(error) = self.connection.batch_execute(&format!("{statement};")) {
+                    if let DieselError::DatabaseError(_, information) = &error
+                        && let Some(refusal) = postgres_error(information.message())
+                    {
+                        return Ok(Outcome::Rejected(refusal.sqlstate().to_string()));
+                    }
+                    return Err(error.into());
+                }
+            }
+            let changed = diesel::sql_query("SELECT key FROM probe_changes")
+                .load::<KeyRow>(&mut self.connection)?;
+            Ok(Outcome::Applied(
+                changed.into_iter().map(|row| row.key).collect(),
+            ))
+        })();
+        self.connection
+            .batch_execute("ROLLBACK TO probe; RELEASE probe")?;
+        result.map(Prepared::Ready)
+    }
+
+    /// Translate one statement against the replica's schema and select the caller.
+    fn translate(&self, caller: usize, statement: &str) -> Result<Prepared<Vec<Statement>>> {
+        anyhow::ensure!(
+            caller < self.session.callers.len(),
+            "Caller index is outside the case"
+        );
+        self.session.caller.store(caller, Ordering::Relaxed);
+        Ok(
+            match Pg2Sqlite::default()
+                .sql(statement)
+                .and_then(|source| source.translate_with_schema(&self.schema, &self.options))
+            {
+                Ok(script) => Prepared::Ready(script.into_vec()),
+                Err(error) => Prepared::Refused(error.to_string()),
+            },
+        )
+    }
+}
+
+/// Record the key of every row a statement writes to `physical` in `probe_changes`.
+fn track_changes(
+    connection: &mut SqliteConnection,
+    physical: Option<&str>,
+    key: &str,
+) -> Result<()> {
+    connection.batch_execute("CREATE TEMP TABLE probe_changes (key TEXT NOT NULL)")?;
+    let Some(physical) = physical else {
+        return Ok(());
+    };
+    let physical = identifier(physical);
+    let old = format!("(CAST(OLD.{} AS TEXT))", identifier(key));
+    let new = format!("(CAST(NEW.{} AS TEXT))", identifier(key));
+    for (event, rows) in [
+        ("INSERT", new.clone()),
+        ("UPDATE", format!("{old}, {new}")),
+        ("DELETE", old),
+    ] {
+        connection.batch_execute(&format!(
+            "CREATE TEMP TRIGGER probe_{event} AFTER {event} ON main.{physical} \
+             BEGIN INSERT INTO probe_changes VALUES {rows}; END"
+        ))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

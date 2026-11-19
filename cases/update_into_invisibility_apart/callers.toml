@@ -6,3 +6,7 @@ columns = ["id"]
 name = "alice"
 role = "app_reader"
 settings = { "app.user_id" = "alice", "app.subjects" = "bob" }
+
+[[writes]]
+shape = "update"
+set = { owner = "bob" }

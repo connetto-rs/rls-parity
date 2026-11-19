@@ -9,6 +9,8 @@ mod sqlite;
 
 pub use runner::{RunError, observe_cases, read_known};
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug)]
@@ -17,12 +19,39 @@ pub(crate) enum Prepared<T> {
     Refused(String),
 }
 
+/// What one write statement did on a database.
+pub(crate) enum Outcome {
+    /// The statement ran and changed the rows with these keys.
+    Applied(BTreeSet<String>),
+    /// The statement aborted with this SQLSTATE.
+    Rejected(String),
+}
+
+impl Outcome {
+    /// The answer this outcome gives for the row with `key`.
+    fn answer(&self, key: &str) -> Answer {
+        match self {
+            Self::Applied(keys) if keys.contains(key) => Answer::Changed,
+            Self::Applied(_) => Answer::Skipped,
+            Self::Rejected(sqlstate) => Answer::Rejected(sqlstate.clone()),
+        }
+    }
+}
+
 /// An engine's answer for one row.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Answer {
     Visible,
     Hidden,
+    /// A write changed the row, or `OpenFGA` permits the write.
+    Changed,
+    /// A write ran and left the row alone because no policy let it reach the row.
+    Skipped,
+    /// A write aborted with this SQLSTATE.
+    Rejected(String),
+    /// `OpenFGA` refuses the write, which agrees with a skipped or a rejected row.
+    Denied,
     Refused(String),
     Error(String),
 }
@@ -53,6 +82,9 @@ pub enum Engine {
 pub enum Direction {
     Wider,
     Narrower,
+    /// Both refuse the write, one by skipping the row and the other by aborting, or with
+    /// different SQLSTATEs.
+    DifferentDenial,
     Refused,
     Error,
 }
@@ -77,8 +109,16 @@ fn direction(oracle: &Answer, actual: &Answer) -> Option<Direction> {
     }
     Some(match (oracle, actual) {
         (_, Answer::Refused(_)) => Direction::Refused,
-        (Answer::Visible, Answer::Hidden) => Direction::Narrower,
-        (Answer::Hidden, Answer::Visible) => Direction::Wider,
+        (Answer::Skipped | Answer::Rejected(_), Answer::Denied) => return None,
+        (Answer::Visible, Answer::Hidden)
+        | (Answer::Changed, Answer::Skipped | Answer::Rejected(_) | Answer::Denied) => {
+            Direction::Narrower
+        }
+        (Answer::Hidden, Answer::Visible)
+        | (Answer::Skipped | Answer::Rejected(_), Answer::Changed) => Direction::Wider,
+        (Answer::Skipped | Answer::Rejected(_), Answer::Skipped | Answer::Rejected(_)) => {
+            Direction::DifferentDenial
+        }
         _ => Direction::Error,
     })
 }
@@ -189,7 +229,7 @@ mod tests {
         }
     }
 
-    /// Visibility, translation refusals and execution failures have distinct directions.
+    /// Visibility, write outcomes, translation refusals and execution failures have distinct directions.
     #[test]
     fn answer_directions() {
         for (oracle, actual, expected) in [
@@ -206,6 +246,32 @@ mod tests {
                 Some(Direction::Error),
             ),
             (Answer::Hidden, Answer::Hidden, None),
+            (Answer::Skipped, Answer::Denied, None),
+            (Answer::Rejected("42501".into()), Answer::Denied, None),
+            (
+                Answer::Rejected("42501".into()),
+                Answer::Rejected("42501".into()),
+                None,
+            ),
+            (Answer::Changed, Answer::Denied, Some(Direction::Narrower)),
+            (Answer::Changed, Answer::Skipped, Some(Direction::Narrower)),
+            (Answer::Skipped, Answer::Changed, Some(Direction::Wider)),
+            (
+                Answer::Rejected("42501".into()),
+                Answer::Changed,
+                Some(Direction::Wider),
+            ),
+            (
+                Answer::Rejected("42501".into()),
+                Answer::Skipped,
+                Some(Direction::DifferentDenial),
+            ),
+            (
+                Answer::Rejected("42501".into()),
+                Answer::Rejected("23505".into()),
+                Some(Direction::DifferentDenial),
+            ),
+            (Answer::Visible, Answer::Changed, Some(Direction::Error)),
         ] {
             assert_eq!(direction(&oracle, &actual), expected);
         }

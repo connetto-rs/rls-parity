@@ -157,15 +157,20 @@ fn fixture_edge_cases(root: &Path, database_url: &str, openfga_url: &str) -> any
             std::fs::write(case.join(file), content)?;
         }
         let observations = observe_cases(directory.path(), database_url, openfga_url)?;
-        assert_eq!(observations.len(), 4);
+        assert_eq!(observations.len(), 8);
         for observation in &observations {
+            let read = observation.statement.starts_with("SELECT");
             if name == "text_key" {
                 assert!(["docs:one", "docs:two"].contains(&observation.row.as_str()));
-                assert_eq!(observation.postgres, observation.sqlite);
-                assert_eq!(observation.postgres, observation.openfga);
-            } else if name == "missing_key" {
+                if read {
+                    assert_eq!(observation.postgres, observation.sqlite);
+                    assert_eq!(observation.postgres, observation.openfga);
+                } else {
+                    assert_eq!(observation.postgres, Answer::Rejected("42501".into()));
+                }
+            } else if read && name == "missing_key" {
                 assert!(matches!(observation.openfga, Answer::Error(_)));
-            } else {
+            } else if read {
                 assert!(matches!(observation.postgres, Answer::Error(_)));
                 assert!(matches!(observation.openfga, Answer::Refused(_)));
             }
@@ -190,8 +195,12 @@ fn omitted_table_seed_is_skipped(
         )?;
     }
     let observations = observe_cases(directory.path(), database_url, openfga_url)?;
-    assert_eq!(observations.len(), 4);
-    for observation in &observations {
+    let reads: Vec<_> = observations
+        .iter()
+        .filter(|observation| observation.statement.starts_with("SELECT"))
+        .collect();
+    assert_eq!(reads.len(), 4);
+    for observation in reads {
         assert!(
             matches!(&observation.postgres, Answer::Error(reason) if reason.contains("permission denied")),
             "{observation:?}"

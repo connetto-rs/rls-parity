@@ -11,3 +11,7 @@ settings = { "app.user_id" = "alice", "app.subjects" = "" }
 name = "bob"
 role = "app_reader"
 settings = { "app.user_id" = "bob", "app.subjects" = "" }
+
+[[writes]]
+shape = "insert"
+row = { id = 3, owner = "alice", body = "c" }

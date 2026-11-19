@@ -1,8 +1,9 @@
 use std::{collections::BTreeMap, fs, path::Path};
 
 use anyhow::{Context, Result, ensure};
-use rls2fga::types::ActionStatement;
+use rls2fga::types::{ActionStatement, ColumnCommand};
 use serde::Deserialize;
+use serde_json::Value;
 use sql_traits::prelude::{Deployment, SessionSetting, SetPacking, SettingValue};
 use sqlparser::ast::DataType;
 
@@ -20,6 +21,10 @@ pub(crate) struct Caller {
 pub(crate) enum Shape {
     Select,
     SelectForUpdate,
+    Update,
+    UpdateWithoutWhere,
+    Delete,
+    Insert,
 }
 
 impl Shape {
@@ -28,7 +33,16 @@ impl Shape {
         match self {
             Self::Select => ActionStatement::Select,
             Self::SelectForUpdate => ActionStatement::SelectForUpdate,
+            Self::Update => ActionStatement::Update,
+            Self::UpdateWithoutWhere => ActionStatement::UpdateWithoutWhere,
+            Self::Delete => ActionStatement::Delete,
+            Self::Insert => ActionStatement::Insert,
         }
+    }
+
+    /// Whether the shape reads rows without writing any.
+    pub fn reads(self) -> bool {
+        matches!(self, Self::Select | Self::SelectForUpdate)
     }
 }
 
@@ -36,6 +50,12 @@ impl Shape {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Write {
     pub shape: Shape,
+    /// Columns an update assigns, with the values it assigns.
+    #[serde(default)]
+    pub set: BTreeMap<String, Value>,
+    /// The row an insert writes.
+    #[serde(default)]
+    pub row: BTreeMap<String, Value>,
 }
 
 #[derive(Deserialize)]
@@ -81,13 +101,30 @@ impl Case {
                 "Declare both session settings"
             );
         }
-        ensure!(
-            config
-                .writes
-                .iter()
-                .all(|write| write.shape != Shape::Select),
-            "Every case already measures SELECT"
-        );
+        for write in &config.writes {
+            ensure!(
+                write.shape != Shape::Select,
+                "Every case already measures SELECT"
+            );
+            let needs_set = matches!(write.shape, Shape::Update | Shape::UpdateWithoutWhere);
+            let needs_row = write.shape == Shape::Insert;
+            ensure!(
+                write.set.is_empty() != needs_set,
+                "{:?} {} `set`",
+                write.shape,
+                if needs_set { "requires" } else { "takes no" }
+            );
+            ensure!(
+                write.row.is_empty() != needs_row,
+                "{:?} {} `row`",
+                write.shape,
+                if needs_row { "requires" } else { "takes no" }
+            );
+            ensure!(
+                !needs_row || write.row.contains_key(&config.key),
+                "An inserted row must carry the row key"
+            );
+        }
         Ok(Self {
             name: path
                 .file_name()
@@ -120,12 +157,26 @@ impl Case {
         )?)
     }
 
-    /// Every shape this case measures, `SELECT` first.
+    /// Every read shape this case measures, `SELECT` first.
     pub fn shapes(&self) -> impl Iterator<Item = Shape> + '_ {
-        std::iter::once(Shape::Select).chain(self.config.writes.iter().map(|write| write.shape))
+        std::iter::once(Shape::Select).chain(
+            self.config
+                .writes
+                .iter()
+                .map(|write| write.shape)
+                .filter(|shape| shape.reads()),
+        )
     }
 
-    /// Build the read whose visibility is measured under `shape`.
+    /// Every write probe this case measures.
+    pub fn writes(&self) -> impl Iterator<Item = &Write> {
+        self.config
+            .writes
+            .iter()
+            .filter(|write| !write.shape.reads())
+    }
+
+    /// Build the read measured under a read shape.
     pub fn statement(&self, shape: Shape) -> String {
         let read = format!(
             "SELECT {} FROM {}",
@@ -137,10 +188,104 @@ impl Case {
                 .join(", "),
             identifier(&self.config.table)
         );
-        match shape {
-            Shape::Select => read,
-            Shape::SelectForUpdate => format!("{read} FOR UPDATE"),
+        if shape == Shape::SelectForUpdate {
+            format!("{read} FOR UPDATE")
+        } else {
+            read
         }
+    }
+
+    /// Build `write` as a caller runs it, on the row with `key` or, without one, as declared.
+    pub fn write_statement(&self, write: &Write, key: Option<&Value>) -> String {
+        self.write_sql(write, key, false)
+    }
+
+    /// Build `write` returning the row it produces, which the table owner runs to learn it.
+    pub fn resulting_statement(&self, write: &Write, key: Option<&Value>) -> String {
+        self.write_sql(write, key, true)
+    }
+
+    fn write_sql(&self, write: &Write, key: Option<&Value>, returning: bool) -> String {
+        let table = identifier(&self.config.table);
+        let alias = if returning { " AS t" } else { "" };
+        let returning = if returning {
+            " RETURNING to_jsonb(t) AS row"
+        } else {
+            ""
+        };
+        let filter = key.map_or_else(String::new, |key| {
+            format!(" WHERE {} = {}", identifier(&self.config.key), literal(key))
+        });
+        match write.shape {
+            Shape::Insert => format!(
+                "INSERT INTO {table}{alias} ({}) VALUES ({}){returning}",
+                write
+                    .row
+                    .keys()
+                    .map(|column| identifier(column))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                write
+                    .row
+                    .values()
+                    .map(literal)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Shape::Delete => format!("DELETE FROM {table}{alias}{filter}{returning}"),
+            _ => format!(
+                "UPDATE {table}{alias} SET {}{filter}{returning}",
+                write
+                    .set
+                    .iter()
+                    .map(|(column, value)| format!("{} = {}", identifier(column), literal(value)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+
+    /// The columns a read touches under each column command.
+    pub fn read_columns(&self) -> BTreeMap<ColumnCommand, Vec<String>> {
+        BTreeMap::from([(ColumnCommand::Select, self.config.columns.clone())])
+    }
+}
+
+impl Write {
+    /// The columns this write touches under each column command, `key` being the row key
+    /// a keyed `WHERE` reads.
+    pub fn columns(&self, key: &str) -> BTreeMap<ColumnCommand, Vec<String>> {
+        let read = match self.shape {
+            Shape::Update | Shape::Delete => vec![key.to_owned()],
+            _ => Vec::new(),
+        };
+        let (command, assigned) = match self.shape {
+            Shape::Insert => (ColumnCommand::Insert, &self.row),
+            _ => (ColumnCommand::Update, &self.set),
+        };
+        BTreeMap::from([
+            (ColumnCommand::Select, read),
+            (command, assigned.keys().cloned().collect()),
+        ])
+    }
+}
+
+/// The text a row key compares as, the way `CAST(key AS TEXT)` prints it.
+pub(crate) fn key_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Spell a declared or seeded value as a PostgreSQL literal.
+fn literal(value: &Value) -> String {
+    match value {
+        Value::Null => "NULL".into(),
+        Value::Bool(flag) => flag.to_string(),
+        Value::Number(number) => number.to_string(),
+        Value::String(text) => format!("'{}'", text.replace('\'', "''")),
+        other => format!("'{}'", other.to_string().replace('\'', "''")),
     }
 }
 
@@ -185,6 +330,26 @@ mod tests {
                 format!("{valid}\n[[writes]]\nshape = \"select\"\n"),
                 "already measures SELECT",
             ),
+            (
+                format!("{valid}\n[[writes]]\nshape = \"update\"\n"),
+                "requires `set`",
+            ),
+            (
+                format!("{valid}\n[[writes]]\nshape = \"delete\"\nset = {{ body = \"x\" }}\n"),
+                "takes no `set`",
+            ),
+            (
+                format!("{valid}\n[[writes]]\nshape = \"insert\"\n"),
+                "requires `row`",
+            ),
+            (
+                format!("{valid}\n[[writes]]\nshape = \"delete\"\nrow = {{ id = 9 }}\n"),
+                "takes no `row`",
+            ),
+            (
+                format!("{valid}\n[[writes]]\nshape = \"insert\"\nrow = {{ owner = \"alice\" }}\n"),
+                "must carry the row key",
+            ),
         ] {
             fs::write(directory.path().join("callers.toml"), config)?;
             let error = Case::read(directory.path())
@@ -205,6 +370,23 @@ mod tests {
         assert_eq!(
             case.statement(Shape::Select),
             "SELECT \"id\", \"odd\"\"column\" FROM \"odd\"\"table\""
+        );
+        Ok(())
+    }
+
+    /// Write values reach PostgreSQL as literals of their JSON type, quotes escaped.
+    #[test]
+    fn write_literals() -> Result<()> {
+        let case =
+            Case::read(&Path::new(env!("CARGO_MANIFEST_DIR")).join("cases/grant_without_update"))?;
+        let write: Write = serde_json::from_value(serde_json::json!({
+            "shape": "update",
+            "set": { "a": null, "b": true, "c": "it's", "d": ["x'y"] },
+        }))?;
+        assert_eq!(
+            case.write_statement(&write, Some(&"o'k".into())),
+            "UPDATE \"docs\" SET \"a\" = NULL, \"b\" = true, \"c\" = 'it''s', \"d\" = '[\"x''y\"]' \
+             WHERE \"id\" = 'o''k'"
         );
         Ok(())
     }

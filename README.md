@@ -6,15 +6,17 @@ Compare PostgreSQL row visibility with the SQLite replica from `pg2sqlite` and t
 
 ## Cases
 
-Each directory in `cases/` contains standalone `schema.sql`, `seed.sql` and `callers.toml`. The latter declares `table`, `key`, `columns`, and `[[callers]]` with `name`, `role`, and `settings` containing `app.user_id` and `app.subjects`. All callers use the declared reader role, with text identity and comma-delimited subjects. Every case measures `SELECT`, and a `[[writes]]` entry with `shape = "select_for_update"` also measures the locking read `SELECT ... FOR UPDATE`, which `OpenFGA` answers as its own action.
+Each directory in `cases/` contains standalone `schema.sql`, `seed.sql` and `callers.toml`. The latter declares `table`, `key`, `columns`, and `[[callers]]` with `name`, `role`, and `settings` containing `app.user_id` and `app.subjects`. All callers use the declared reader role, with text identity and comma-delimited subjects. Every case measures `SELECT`. A `[[writes]]` entry adds a probe of shape `select_for_update`, `update` or `update_without_where` with a `set` table, `delete`, or `insert` with a `row` table carrying the row key. `OpenFGA` answers the locking read as its own action.
+
+An `update` or `delete` probe runs once per seeded row, filtered by its key, while `update_without_where` and `insert` run once. Every write is rolled back. PostgreSQL and the replica answer `changed` or `skipped` per row, or `rejected` with the SQLSTATE that aborted the statement. `OpenFGA` answers `changed` or `denied` from the existing row's tuples and, for the row an `INSERT` or `UPDATE` would leave, from the tuples `rls2fga` derives for it.
 
 The SQLite replica runs the statement as `pg2sqlite` translates it, so a clause the translation drops is dropped in the measurement too.
 
-`known.toml` identifies each discrepancy by `case`, `caller`, `row`, `statement`, `engine`, `direction` and `finding`. Directions are `wider`, `narrower`, `refused` and `error`. Unexpected discrepancies and entries that no longer occur fail the run.
+`known.toml` identifies each discrepancy by `case`, `caller`, `row`, `statement`, `engine`, `direction` and `finding`. Directions are `wider`, `narrower`, `different_denial`, `refused` and `error`. `different_denial` marks a write both engines refuse, one by skipping the row and the other by aborting, or with different SQLSTATEs. Unexpected discrepancies and entries that no longer occur fail the run.
 
 Engine errors count as discrepancies even when both engines reject the read. An absent replica table reports its SQLite error for every oracle row.
 
-Cases cover role inheritance, caller settings, grants, policy interactions, and table layouts. `INSERT`, `UPDATE` and `DELETE` probes are measured through their read side only. Both `to_role_member` variants use the declared acting role.
+Cases cover role inheritance, caller settings, grants, policy interactions, writes, and table layouts. Both `to_role_member` variants use the declared acting role.
 
 ## Run
 
