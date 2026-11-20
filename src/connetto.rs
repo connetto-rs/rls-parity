@@ -20,7 +20,7 @@ pub(crate) fn deployment() -> Result<Deployment> {
     Ok(connetto_schema::deployment::<String>(READER_ROLE)?)
 }
 
-/// The options connetto translates the replica under, acting as `role`.
-pub(crate) fn replica_options(role: &str) -> Result<Pg2SqliteOptions> {
-    Ok(connetto_schema::query_options::<String>(READER_ROLE)?.with_acting_role(role))
+/// The options connetto translates the replica under, before choosing its acting role.
+pub(crate) fn replica_options() -> Result<Pg2SqliteOptions> {
+    Ok(connetto_schema::query_options::<String>(READER_ROLE)?)
 }

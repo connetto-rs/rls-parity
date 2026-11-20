@@ -64,11 +64,10 @@ extern "SQL" {
     fn uuidv4() -> Binary;
 }
 
-/// The options the replica of a files case translates under, acting as `role`.
-fn files_options(case: &Case, role: &str, jsonb: JsonbFunctions) -> Result<Pg2SqliteOptions> {
+/// The options the replica of a files case translates under, before choosing its acting role.
+fn files_options(case: &Case, jsonb: JsonbFunctions) -> Result<Pg2SqliteOptions> {
     Ok(Pg2SqliteOptions::default()
         .with_deployment(case.config.deployment()?)
-        .with_acting_role(role)
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_function_name("uuidv4")
         .with_rls_audit_table_name("rls_audit".to_owned())
@@ -94,13 +93,15 @@ pub(crate) struct Replica {
 }
 
 impl Replica {
-    /// Load the script emitted for `role` and seed its published physical tables.
+    /// Load the script emitted for `role` and seed its published physical tables as the
+    /// table owner, as PostgreSQL loads the seed.
     pub fn create(case: &Case, role: &str) -> Result<Prepared<Self>> {
         let jsonb = JsonbFunctions::new("jsonb_canonical", "jsonb_text", "jsonb_order");
-        let options = match case.config.source {
-            Source::Files => files_options(case, role, jsonb.clone())?,
-            Source::Connetto => connetto::replica_options(role)?,
+        let owner = match case.config.source {
+            Source::Files => files_options(case, jsonb.clone())?,
+            Source::Connetto => connetto::replica_options()?,
         };
+        let options = owner.clone().with_acting_role(role);
         let translator = match Pg2Sqlite::default().sql(&case.schema) {
             Ok(translator) => translator,
             Err(error) => return Ok(Prepared::Refused(error.to_string())),
@@ -149,7 +150,7 @@ impl Replica {
         let schema = translator.build_schema()?;
         let seed = Pg2Sqlite::default()
             .sql(&case.seed)?
-            .translate_with_schema(&schema, &options)?;
+            .translate_with_schema(&schema, &owner)?;
         session.exempt.store(true, Ordering::Relaxed);
         for mut statement in seed.into_vec() {
             if let Statement::Insert(insert) = &mut statement {

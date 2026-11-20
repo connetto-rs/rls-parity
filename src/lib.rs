@@ -152,9 +152,17 @@ pub struct KnownList {
     pub construct: Vec<KnownConstruct>,
 }
 
-/// Classify an engine answer against the live oracle.
+/// Classify an engine answer against the live oracle. An engine error or refusal carrying
+/// PostgreSQL's own error agrees with it, and any other error is a discrepancy.
 fn direction(oracle: &Answer, actual: &Answer) -> Option<Direction> {
-    if oracle == actual && !matches!(oracle, Answer::Error(_)) {
+    let agrees = match (oracle, actual) {
+        (Answer::Error(expected), Answer::Error(message) | Answer::Refused(message)) => {
+            expected == message
+        }
+        (Answer::Error(_), _) => false,
+        _ => oracle == actual,
+    };
+    if agrees {
         return None;
     }
     Some(match (oracle, actual) {
@@ -308,9 +316,15 @@ mod tests {
             .len(),
             2
         );
-        unrelated.postgres = Answer::Error("broken query".into());
-        unrelated.sqlite = Answer::Error("broken query".into());
-        unrelated.openfga = Answer::Error("broken query".into());
+        unrelated.postgres = Answer::Error("permission denied for table docs".into());
+        unrelated.sqlite = Answer::Refused("permission denied for table docs".into());
+        unrelated.openfga = Answer::Error("permission denied for table docs".into());
+        assert_eq!(
+            compare_rows(std::slice::from_ref(&unrelated), &[]),
+            Vec::<String>::new()
+        );
+        unrelated.sqlite = Answer::Error("no such table: docs".into());
+        unrelated.openfga = Answer::Hidden;
         assert_eq!(compare_rows(&[unrelated], &[]).len(), 2);
         observation.sqlite = Answer::Visible;
         let errors = compare_rows(&[observation], &[known]);
@@ -364,7 +378,8 @@ mod tests {
         }
     }
 
-    /// Visibility, write outcomes, translation refusals and execution failures have distinct directions.
+    /// Visibility, write outcomes, translation refusals and execution failures have distinct
+    /// directions, and an answer carrying PostgreSQL's own error agrees with it.
     #[test]
     fn answer_directions() {
         for (oracle, actual, expected) in [
@@ -407,6 +422,26 @@ mod tests {
                 Some(Direction::DifferentDenial),
             ),
             (Answer::Visible, Answer::Changed, Some(Direction::Error)),
+            (
+                Answer::Error("permission denied for table docs".into()),
+                Answer::Refused("permission denied for table docs".into()),
+                None,
+            ),
+            (
+                Answer::Error("permission denied for table docs".into()),
+                Answer::Error("permission denied for table docs".into()),
+                None,
+            ),
+            (
+                Answer::Error("permission denied for table docs".into()),
+                Answer::Refused("unsupported".into()),
+                Some(Direction::Refused),
+            ),
+            (
+                Answer::Error("permission denied for table docs".into()),
+                Answer::Error("no such table: docs".into()),
+                Some(Direction::Error),
+            ),
         ] {
             assert_eq!(direction(&oracle, &actual), expected);
         }
