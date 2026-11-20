@@ -53,16 +53,6 @@ construct = "jsonb_scalar_extraction"
 engine = "sqlite"
 finding = "7, JSON numeric and boolean extraction returns an integer instead of text"
 
-[[construct]]
-construct = "bare_boolean_column"
-engine = "openfga"
-finding = "rls2fga grades a bare boolean column test at confidence D while `= true` translates, upstream/bare-boolean-column"
-
-[[construct]]
-construct = "policy_for_role_without_privilege"
-engine = "openfga"
-finding = "rls2fga reports INSERT policies below threshold when they reach only an acting role without INSERT, upstream/coverage-note-unprivileged-role"
-
 [[refusal]]
 case = "membership_under_rls"
 engine = "openfga"
