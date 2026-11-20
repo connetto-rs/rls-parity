@@ -1,0 +1,102 @@
+source = "connetto"
+
+[[tables]]
+name = "orders"
+key = ["id"]
+columns = ["id", "owner_id", "quantity"]
+
+[[tables]]
+name = "order_lines"
+key = ["order_id", "line_no"]
+columns = ["order_id", "line_no", "owner_id", "quantity"]
+
+[[tables]]
+name = "photos"
+key = ["id"]
+columns = ["id", "order_id", "owner_id", "team_id"]
+
+[[tables]]
+name = "products"
+key = ["id"]
+columns = ["id", "name", "price_cents"]
+
+[[tables]]
+name = "teams"
+key = ["id"]
+columns = ["id"]
+
+[[tables]]
+name = "team_members"
+key = ["team_id", "member_id"]
+columns = ["team_id", "member_id"]
+
+[[tables]]
+name = "team_notes"
+key = ["id"]
+columns = ["id", "team_id", "author_id", "body"]
+
+[[tables]]
+name = "users"
+key = ["id"]
+columns = ["id", "login_name"]
+
+# Persons carry the bot-list wildcard, so the cap policies pass them through.
+[[callers]]
+name = "alice"
+role = "connetto_reader"
+settings = { "app.user_id" = "alice", "app.subjects" = "", "app.bot_list" = "*" }
+
+[[callers]]
+name = "bob_holding_alice"
+role = "connetto_reader"
+settings = { "app.user_id" = "bob", "app.subjects" = "alice", "app.bot_list" = "*" }
+
+[[callers]]
+name = "carol"
+role = "connetto_reader"
+settings = { "app.user_id" = "carol", "app.subjects" = "", "app.bot_list" = "*" }
+
+# Bots act for alice under their own lists, which allow some cap verbs and refuse the rest.
+[[callers]]
+name = "bot_reader"
+role = "connetto_reader"
+settings = { "app.user_id" = "alice", "app.subjects" = "", "app.bot_list" = "orders:read,order_lines:read,photos:read,products:read,teams:read,team_members:read,team_notes:read,users:read" }
+
+[[callers]]
+name = "bot_writer"
+role = "connetto_reader"
+settings = { "app.user_id" = "alice", "app.subjects" = "", "app.bot_list" = "orders:update,order_lines:update,photos:insert,photos:update,photos:delete,team_notes:insert" }
+
+[[callers]]
+name = "bot_unlisted"
+role = "connetto_reader"
+settings = { "app.user_id" = "alice", "app.subjects" = "", "app.bot_list" = "" }
+
+[[writes]]
+table = "orders"
+shape = "update"
+set = { quantity = 5 }
+
+[[writes]]
+table = "order_lines"
+shape = "update"
+set = { quantity = 5 }
+
+[[writes]]
+table = "photos"
+shape = "update"
+set = { content_state = "ready" }
+
+[[writes]]
+table = "photos"
+shape = "delete"
+
+[[writes]]
+table = "photos"
+shape = "insert"
+row = { id = "30000000-0000-4000-8000-000000000003", order_id = "20000000-0000-4000-8000-000000000001", owner_id = "alice", content_id = "\\x03", team_id = "red" }
+
+[[writes]]
+table = "team_notes"
+shape = "insert"
+row = { id = "40000000-0000-4000-8000-000000000002", team_id = "red", author_id = "alice", body = "retro" }

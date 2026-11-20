@@ -10,6 +10,8 @@ Each directory in `cases/` contains standalone `schema.sql`, `seed.sql` and `cal
 
 An `update` or `delete` probe runs once per seeded row, filtered by its key, while `update_without_where` and `insert` run once. Every write is rolled back. PostgreSQL and the replica answer `changed` or `skipped` per row, or `rejected` with the SQLSTATE that aborted the statement. `OpenFGA` answers `changed` or `denied` from the existing row's tuples and, for the row an `INSERT` or `UPDATE` would leave, from the tuples `rls2fga` derives for it.
 
+A `callers.toml` with `source = "connetto"` takes its schema from connetto's demo deployment instead of a `schema.sql`, composed the way connetto's server reads it, with the bot registry and the cap policies. The replica translates under connetto's own options and both translators read connetto's deployment, so its callers act as `connetto_reader` and set `app.bot_list` beside `app.user_id` and `app.subjects`. A person carries the wildcard `*`, and a bot carries the `table:verb` entries it may use.
+
 The SQLite replica runs the statement as `pg2sqlite` translates it, so a clause the translation drops is dropped in the measurement too.
 
 A `[[known]]` entry in `known.toml` identifies each row discrepancy by `case`, `caller`, `row`, `statement`, `engine`, `direction` and `finding`. Directions are `wider`, `narrower`, `different_denial`, `refused` and `error`. `different_denial` marks a write both engines refuse, one by skipping the row and the other by aborting, or with different SQLSTATEs. Unexpected discrepancies and entries that no longer occur fail the run.

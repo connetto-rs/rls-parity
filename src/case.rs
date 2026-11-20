@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+};
 
 use anyhow::{Context, Result, ensure};
 use rls2fga::types::{ActionStatement, ColumnCommand};
@@ -6,6 +10,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use sql_traits::prelude::{Deployment, SessionSetting, SetPacking, SettingValue};
 use sqlparser::ast::DataType;
+
+use crate::connetto;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -69,9 +75,22 @@ pub(crate) struct Table {
     pub columns: Vec<String>,
 }
 
+/// Where a case's schema, deployment and replica options come from.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Source {
+    /// The case directory's own `schema.sql`, under rls-parity's deployment.
+    #[default]
+    Files,
+    /// connetto's demo deployment, composed and translated the way connetto does.
+    Connetto,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Config {
+    #[serde(default)]
+    pub source: Source,
     pub tables: Vec<Table>,
     pub callers: Vec<Caller>,
     #[serde(default)]
@@ -109,12 +128,27 @@ impl Case {
                 table.name
             );
         }
+        let deployment = config.deployment()?;
+        let declared: BTreeSet<&str> = deployment
+            .settings()
+            .iter()
+            .map(SessionSetting::name)
+            .collect();
         for caller in &config.callers {
             ensure!(
-                caller.settings.len() == 2
-                    && caller.settings.contains_key("app.user_id")
-                    && caller.settings.contains_key("app.subjects"),
-                "Declare both session settings"
+                deployment.acting_roles().any(|role| role == caller.role),
+                "Caller {} acts as {}, which the deployment does not",
+                caller.name,
+                caller.role
+            );
+            ensure!(
+                caller
+                    .settings
+                    .keys()
+                    .map(String::as_str)
+                    .eq(declared.iter().copied()),
+                "Declare every session setting the deployment names: {}",
+                declared.iter().copied().collect::<Vec<_>>().join(", ")
             );
         }
         for write in &config.writes {
@@ -153,40 +187,13 @@ impl Case {
                 .to_str()
                 .context("Case name is not UTF-8")?
                 .to_owned(),
-            schema: fs::read_to_string(path.join("schema.sql"))?,
+            schema: match config.source {
+                Source::Files => fs::read_to_string(path.join("schema.sql"))?,
+                Source::Connetto => connetto::schema()?,
+            },
             seed: fs::read_to_string(path.join("seed.sql"))?,
             config,
         })
-    }
-
-    /// Every acting role the callers name, in the order they first appear.
-    pub fn acting_roles(&self) -> Vec<&str> {
-        let mut roles: Vec<&str> = Vec::new();
-        for caller in &self.config.callers {
-            if !roles.contains(&caller.role.as_str()) {
-                roles.push(&caller.role);
-            }
-        }
-        roles
-    }
-
-    /// Declare connetto's caller and packed subject inputs, logging in as the first caller's
-    /// role and acting as every role a caller names.
-    pub fn deployment(&self) -> Result<Deployment> {
-        Ok(Deployment::new(
-            &self.config.callers[0].role,
-            self.acting_roles(),
-            [
-                SessionSetting::value("app.user_id", SettingValue::Caller(DataType::Text))?,
-                SessionSetting::value(
-                    "app.subjects",
-                    SettingValue::Set {
-                        element: DataType::Text,
-                        packing: SetPacking::Delimited(",".into()),
-                    },
-                )?,
-            ],
-        )?)
     }
 
     /// The declared table named `name`.
@@ -215,6 +222,42 @@ impl Case {
             .writes
             .iter()
             .filter(|write| !write.shape.reads())
+    }
+}
+
+impl Config {
+    /// Every acting role the callers name, in the order they first appear.
+    pub fn acting_roles(&self) -> Vec<&str> {
+        let mut roles: Vec<&str> = Vec::new();
+        for caller in &self.callers {
+            if !roles.contains(&caller.role.as_str()) {
+                roles.push(&caller.role);
+            }
+        }
+        roles
+    }
+
+    /// The deployment the translators read. A files case declares connetto's caller and
+    /// packed subject inputs, logging in as the first caller's role and acting as every role
+    /// a caller names, and the connetto case takes connetto's own.
+    pub fn deployment(&self) -> Result<Deployment> {
+        match self.source {
+            Source::Files => Ok(Deployment::new(
+                &self.callers[0].role,
+                self.acting_roles(),
+                [
+                    SessionSetting::value("app.user_id", SettingValue::Caller(DataType::Text))?,
+                    SessionSetting::value(
+                        "app.subjects",
+                        SettingValue::Set {
+                            element: DataType::Text,
+                            packing: SetPacking::Delimited(",".into()),
+                        },
+                    )?,
+                ],
+            )?),
+            Source::Connetto => connetto::deployment(),
+        }
     }
 }
 
@@ -312,12 +355,12 @@ impl Table {
         Ok(parts.join(","))
     }
 
-    /// The SQL expression spelling a row's key as [`Self::row_key`] does, its columns read
-    /// through `qualifier`.
-    pub fn key_sql(&self, qualifier: &str) -> String {
+    /// The SQL expression spelling a row's key as [`Self::row_key`] does, `column` spelling
+    /// one key column's text.
+    pub fn key_sql(&self, column: impl Fn(&str) -> String) -> String {
         self.key
             .iter()
-            .map(|key| format!("CAST({qualifier}.{} AS TEXT)", identifier(key)))
+            .map(|key| column(key))
             .collect::<Vec<_>>()
             .join(" || ',' || ")
     }
@@ -348,6 +391,11 @@ fn key_text(value: &Value) -> String {
         Value::String(text) => text.clone(),
         other => other.to_string(),
     }
+}
+
+/// A column read through `qualifier` as text, the way PostgreSQL prints it.
+pub(crate) fn text_of(qualifier: &str, column: &str) -> String {
+    format!("CAST({qualifier}.{} AS TEXT)", identifier(column))
 }
 
 /// Spell a declared or seeded value as a PostgreSQL literal.
@@ -405,11 +453,11 @@ mod tests {
             ),
             (
                 valid.replace(", \"app.subjects\" = \"\"", ""),
-                "both session settings",
+                "every session setting",
             ),
             (
                 valid.replace("\"app.subjects\"", "\"app.other\""),
-                "both session settings",
+                "every session setting",
             ),
             (format!("unknown = true\n{valid}"), "unknown field"),
             (
@@ -441,6 +489,22 @@ mod tests {
                     "{valid}\n[[writes]]\ntable = \"docs\"\nshape = \"insert\"\nrow = {{ owner = \"alice\" }}\n"
                 ),
                 "must carry the row key",
+            ),
+            (
+                include_str!("../cases/connetto_deployment/callers.toml").replacen(
+                    "\"connetto_reader\"",
+                    "\"intruder\"",
+                    1,
+                ),
+                "Caller alice acts as intruder, which the deployment does not",
+            ),
+            (
+                include_str!("../cases/connetto_deployment/callers.toml").replacen(
+                    ", \"app.bot_list\" = \"*\"",
+                    "",
+                    1,
+                ),
+                "app.bot_list, app.subjects, app.user_id",
             ),
         ] {
             fs::write(directory.path().join("callers.toml"), config)?;
@@ -503,7 +567,7 @@ mod tests {
         );
         assert_eq!(table.row_key(|column| row.get(column))?, "1,2");
         assert_eq!(
-            table.key_sql("q"),
+            table.key_sql(|key| text_of("q", key)),
             "CAST(q.\"order_id\" AS TEXT) || ',' || CAST(q.\"line_no\" AS TEXT)"
         );
         let error = table

@@ -1,8 +1,8 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -11,7 +11,7 @@ use diesel::{
     connection::SimpleConnection,
     prelude::*,
     result::Error as DieselError,
-    sql_types::{Bool, Text},
+    sql_types::{Binary, Bool, Nullable, Text},
 };
 use pg2sqlite::prelude::*;
 use sql_traits::structs::ParserDB;
@@ -19,21 +19,69 @@ use sqlparser::ast::{Ident, ObjectName, Statement, TableObject};
 
 use crate::{
     Outcome, Prepared,
-    case::{Case, Table, identifier},
+    case::{Case, Source, Table, identifier, text_of},
+    connetto,
     postgres::KeyRow,
 };
 
+/// The caller each replica function answers for, whether writes are exempt, and how many
+/// UUIDs the replica has minted.
 struct Session {
-    callers: Vec<(String, String)>,
+    callers: Vec<BTreeMap<String, String>>,
     caller: AtomicUsize,
     exempt: AtomicBool,
+    minted: AtomicU64,
 }
 
+impl Session {
+    /// The current caller's value of `setting`, `NULL` when the caller sets none, as
+    /// `current_setting(setting, true)` reads it.
+    fn setting(&self, setting: &str) -> Option<String> {
+        self.callers[self.caller.load(Ordering::Relaxed)]
+            .get(setting)
+            .cloned()
+    }
+
+    /// A fresh version 4 UUID as sixteen bytes, numbered from a counter so every run
+    /// mints the same sequence.
+    fn mint_uuid(&self) -> Vec<u8> {
+        let number = self.minted.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut bytes = [0; 16];
+        bytes[8..].copy_from_slice(&number.to_be_bytes());
+        bytes[6] = 0x40;
+        bytes[8] |= 0x80;
+        bytes.to_vec()
+    }
+}
+
+// The names connetto's replica functions carry, which every case's options map to.
 #[diesel::declare_sql_function]
 extern "SQL" {
-    fn current_app_user() -> Text;
-    fn current_subjects() -> Text;
-    fn write_exempt() -> Bool;
+    fn current_app_user() -> Nullable<Text>;
+    fn current_app_subjects() -> Nullable<Text>;
+    fn current_bot_list() -> Nullable<Text>;
+    fn connetto_write_exempt() -> Bool;
+    fn uuidv4() -> Binary;
+}
+
+/// The options the replica of a files case translates under, acting as `role`.
+fn files_options(case: &Case, role: &str, jsonb: JsonbFunctions) -> Result<Pg2SqliteOptions> {
+    Ok(Pg2SqliteOptions::default()
+        .with_deployment(case.config.deployment()?)
+        .with_acting_role(role)
+        .with_uuid_representation(UuidRepresentation::Blob)
+        .with_uuid_function_name("uuidv4")
+        .with_rls_audit_table_name("rls_audit".to_owned())
+        .with_write_exemption_function("connetto_write_exempt")
+        .with_jsonb_functions(jsonb)
+        .with_session_variable(SessionVariableMapping::new(
+            "app.user_id",
+            "current_app_user",
+        ))
+        .with_session_variable(SessionVariableMapping::new(
+            "app.subjects",
+            "current_app_subjects",
+        )))
 }
 
 pub(crate) struct Replica {
@@ -41,28 +89,18 @@ pub(crate) struct Replica {
     session: Arc<Session>,
     schema: ParserDB,
     options: Pg2SqliteOptions,
+    /// How the replica stores each published table, read to spell its keys as text.
+    manifest: Vec<TableManifestEntry>,
 }
 
 impl Replica {
     /// Load the script emitted for `role` and seed its published physical tables.
     pub fn create(case: &Case, role: &str) -> Result<Prepared<Self>> {
         let jsonb = JsonbFunctions::new("jsonb_canonical", "jsonb_order");
-        let options = Pg2SqliteOptions::default()
-            .with_deployment(case.deployment()?)
-            .with_acting_role(role)
-            .with_uuid_representation(UuidRepresentation::Blob)
-            .with_uuid_function_name("uuid_blob")
-            .with_rls_audit_table_name("rls_audit".to_owned())
-            .with_write_exemption_function("write_exempt")
-            .with_jsonb_functions(jsonb.clone())
-            .with_session_variable(SessionVariableMapping::new(
-                "app.user_id",
-                "current_app_user",
-            ))
-            .with_session_variable(SessionVariableMapping::new(
-                "app.subjects",
-                "current_subjects",
-            ));
+        let options = match case.config.source {
+            Source::Files => files_options(case, role, jsonb.clone())?,
+            Source::Connetto => connetto::replica_options(role)?,
+        };
         let translator = match Pg2Sqlite::default().sql(&case.schema) {
             Ok(translator) => translator,
             Err(error) => return Ok(Prepared::Refused(error.to_string())),
@@ -79,30 +117,30 @@ impl Replica {
                 .config
                 .callers
                 .iter()
-                .map(|caller| {
-                    (
-                        caller.settings["app.user_id"].clone(),
-                        caller.settings["app.subjects"].clone(),
-                    )
-                })
+                .map(|caller| caller.settings.clone())
                 .collect(),
             caller: AtomicUsize::new(0),
             exempt: AtomicBool::new(false),
+            minted: AtomicU64::new(0),
         });
         let user = Arc::clone(&session);
         current_app_user_utils::register_nondeterministic_impl(&mut connection, move || {
-            user.callers[user.caller.load(Ordering::Relaxed)].0.clone()
+            user.setting("app.user_id")
         })?;
         let subjects = Arc::clone(&session);
-        current_subjects_utils::register_nondeterministic_impl(&mut connection, move || {
-            subjects.callers[subjects.caller.load(Ordering::Relaxed)]
-                .1
-                .clone()
+        current_app_subjects_utils::register_nondeterministic_impl(&mut connection, move || {
+            subjects.setting("app.subjects")
+        })?;
+        let bot_list = Arc::clone(&session);
+        current_bot_list_utils::register_nondeterministic_impl(&mut connection, move || {
+            bot_list.setting("app.bot_list")
         })?;
         let exempt = Arc::clone(&session);
-        write_exempt_utils::register_nondeterministic_impl(&mut connection, move || {
+        connetto_write_exempt_utils::register_nondeterministic_impl(&mut connection, move || {
             exempt.exempt.load(Ordering::Relaxed)
         })?;
+        let minted = Arc::clone(&session);
+        uuidv4_utils::register_nondeterministic_impl(&mut connection, move || minted.mint_uuid())?;
         for statement in script.iter() {
             connection
                 .batch_execute(&format!("{statement};"))
@@ -142,6 +180,7 @@ impl Replica {
             session,
             schema,
             options,
+            manifest,
         }))
     }
 
@@ -164,10 +203,14 @@ impl Replica {
             .next()
             .filter(|_| queries.next().is_none())
             .with_context(|| format!("{statement} did not translate to one query"))?;
+        let entry = self
+            .manifest
+            .iter()
+            .find(|entry| entry.logical == table.name);
         // The case supplies the statement and row key at runtime.
         let rows = diesel::sql_query(format!(
             "SELECT {} AS key FROM ({query}) q",
-            table.key_sql("q"),
+            table.key_sql(|key| replica_text(entry, "q", key)),
         ))
         .load::<KeyRow>(&mut self.connection)?;
         Ok(Prepared::Ready(
@@ -248,8 +291,14 @@ fn track_changes(
         };
         let logical = format!("'{}'", table.name.replace('\'', "''"));
         let physical = identifier(&entry.physical);
-        let old = format!("({logical}, {})", table.key_sql("OLD"));
-        let new = format!("({logical}, {})", table.key_sql("NEW"));
+        let old = format!(
+            "({logical}, {})",
+            table.key_sql(|key| replica_text(Some(entry), "OLD", key))
+        );
+        let new = format!(
+            "({logical}, {})",
+            table.key_sql(|key| replica_text(Some(entry), "NEW", key))
+        );
         for (event, rows) in [
             ("INSERT", new.clone()),
             ("UPDATE", format!("{old}, {new}")),
@@ -264,13 +313,34 @@ fn track_changes(
     Ok(())
 }
 
+/// A replica column read through `qualifier` as the text PostgreSQL prints for it, a UUID
+/// stored as sixteen bytes spelled in its canonical lowercase hyphenated form.
+fn replica_text(entry: Option<&TableManifestEntry>, qualifier: &str, column: &str) -> String {
+    let stored_as_blob = entry.is_some_and(|entry| {
+        entry
+            .columns
+            .iter()
+            .any(|stored| stored.name == column && stored.storage == ColumnStorage::UuidBlob)
+    });
+    if !stored_as_blob {
+        return text_of(qualifier, column);
+    }
+    let hex = format!("hex({qualifier}.{})", identifier(column));
+    let groups: Vec<String> = [(1, 8), (9, 4), (13, 4), (17, 4), (21, 12)]
+        .iter()
+        .map(|(start, length)| format!("substr({hex}, {start}, {length})"))
+        .collect();
+    format!("lower({})", groups.join(" || '-' || "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::case::Shape;
     use std::path::Path;
 
-    /// Registered session functions follow the caller and leave writes unexempted.
+    /// Registered session functions follow the caller, read a setting the caller leaves
+    /// unset as `NULL`, and leave writes unexempted.
     #[test]
     fn caller_session_functions() -> Result<()> {
         let mut case =
@@ -286,13 +356,21 @@ mod tests {
         let select = table.statement(Shape::Select);
         for (index, caller) in case.config.callers.iter().enumerate() {
             replica.visible(table, index, &select)?;
-            let actual = diesel::select((current_app_user(), current_subjects(), write_exempt()))
-                .get_result::<(String, String, bool)>(&mut replica.connection)?;
+            let actual = diesel::select((
+                current_app_user(),
+                current_app_subjects(),
+                current_bot_list(),
+                connetto_write_exempt(),
+            ))
+            .get_result::<(Option<String>, Option<String>, Option<String>, bool)>(
+                &mut replica.connection,
+            )?;
             assert_eq!(
                 actual,
                 (
-                    caller.settings["app.user_id"].clone(),
-                    caller.settings["app.subjects"].clone(),
+                    Some(caller.settings["app.user_id"].clone()),
+                    Some(caller.settings["app.subjects"].clone()),
+                    None,
                     false
                 )
             );

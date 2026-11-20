@@ -12,11 +12,12 @@ use rls2fga::{
     parser::sql_parser::parse_schema,
     translator::{Outputs, TranslatorBuilder},
     types::{
-        ActionAnswer, ActionStatement, ColumnCommand, ConfidenceLevel, Record, RowVersion,
-        records_from_row,
+        ActionAnswer, ActionStatement, ColumnCommand, ConditionParameterName, ConfidenceLevel,
+        Record, RowVersion, records_from_row,
     },
 };
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
+use sql_traits::prelude::{SetPacking, SettingContent, SettingValue};
 
 use crate::{
     Prepared,
@@ -35,6 +36,13 @@ pub(crate) struct Probe<'a> {
     pub columns: BTreeMap<ColumnCommand, Vec<String>>,
 }
 
+/// A delimited set setting and the condition parameter its values travel under.
+struct SetParameter {
+    setting: String,
+    parameter: String,
+    delimiter: String,
+}
+
 pub(crate) struct Model {
     client: Client,
     store_url: String,
@@ -42,6 +50,8 @@ pub(crate) struct Model {
     outputs: Outputs,
     /// Why connetto's gate, `Translation::outputs`, refuses the model, absent when it accepts.
     divergence: Option<String>,
+    /// Every delimited set setting the deployment declares, sent split in each check.
+    sets: Vec<SetParameter>,
     cleaned: bool,
 }
 
@@ -52,7 +62,30 @@ impl Model {
             Ok(parsed) => parsed,
             Err(error) => return Ok(Prepared::Refused(error.to_string())),
         };
-        let translation = match TranslatorBuilder::new(case.deployment()?)
+        let deployment = case.config.deployment()?;
+        let sets = deployment
+            .settings()
+            .iter()
+            .filter_map(|setting| match setting.content() {
+                SettingContent::Value(SettingValue::Set {
+                    packing: SetPacking::Delimited(delimiter),
+                    ..
+                }) => Some((setting.name(), delimiter)),
+                _ => None,
+            })
+            .map(|(setting, delimiter)| {
+                let parameter = serde_json::to_value(ConditionParameterName::derived(setting))?;
+                Ok(SetParameter {
+                    setting: setting.to_owned(),
+                    parameter: parameter
+                        .as_str()
+                        .context("A condition parameter is not text")?
+                        .to_owned(),
+                    delimiter: delimiter.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let translation = match TranslatorBuilder::new(deployment)
             .with_min_confidence(ConfidenceLevel::B)
             .build()
             .translate(&parsed)
@@ -86,6 +119,7 @@ impl Model {
             id: String::new(),
             outputs,
             divergence,
+            sets,
             cleaned: false,
         };
         let created = request(
@@ -227,21 +261,26 @@ impl Model {
         records: &[Value],
     ) -> Result<bool> {
         let user = format!("user:{}", caller.settings["app.user_id"]);
-        let subjects: Vec<&str> = caller.settings["app.subjects"]
-            .split(',')
-            .filter(|item| !item.is_empty())
-            .collect();
         let mut contextual = vec![
             json!({"user":user,"relation":"usage","object":format!("pg_role:{}",caller.role)}),
         ];
         contextual.extend_from_slice(records);
+        let mut context = Map::new();
+        context.insert("settings".into(), json!(caller.settings));
+        for set in &self.sets {
+            let values: Vec<&str> = caller.settings[&set.setting]
+                .split(set.delimiter.as_str())
+                .filter(|item| !item.is_empty())
+                .collect();
+            context.insert(set.parameter.clone(), json!(values));
+        }
         let result = self.post(
             "check",
             &json!({
                 "authorization_model_id":self.id,
                 "tuple_key":{"user":user,"relation":relation,"object":object},
                 "contextual_tuples":{"tuple_keys":contextual},
-                "context":{"settings":caller.settings,"app_subjects":subjects},
+                "context":context,
                 "consistency":"HIGHER_CONSISTENCY"
             }),
         )?;

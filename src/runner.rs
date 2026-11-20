@@ -295,7 +295,8 @@ fn role_replica<'replicas>(
 
 /// Translate one replica per acting role the callers name.
 fn replicas(case: &Case) -> Result<BTreeMap<String, Prepared<Replica>>> {
-    case.acting_roles()
+    case.config
+        .acting_roles()
         .into_iter()
         .map(|role| {
             let replica = Replica::create(case, role)

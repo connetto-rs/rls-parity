@@ -16,7 +16,7 @@ use sqlparser::{ast::Statement, dialect::PostgreSqlDialect, parser::Parser};
 
 use crate::{
     Outcome,
-    case::{Caller, Case, Table, identifier},
+    case::{Caller, Case, Table, identifier, text_of},
 };
 
 #[derive(QueryableByName)]
@@ -165,7 +165,7 @@ impl Database {
             // The case's statement and row key are runtime fixture data.
             let rows = diesel::sql_query(format!(
                 "SELECT {} AS key FROM ({statement}) q",
-                table.key_sql("q"),
+                table.key_sql(|key| text_of("q", key)),
             ))
             .load::<KeyRow>(&mut self.connection)?;
             Ok(rows.into_iter().map(|row| row.key).collect())
@@ -215,7 +215,7 @@ impl Database {
         // The case supplies the table and row key at runtime.
         Ok(diesel::sql_query(format!(
             "SELECT {} AS key, CAST(t.xmin AS TEXT) AS version FROM {} t",
-            table.key_sql("t"),
+            table.key_sql(|key| text_of("t", key)),
             identifier(&table.name)
         ))
         .load::<StoredRow>(&mut self.connection)?
