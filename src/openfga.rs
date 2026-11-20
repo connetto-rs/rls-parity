@@ -211,11 +211,8 @@ impl Model {
                     }
                 }
                 for judgement in produced {
-                    let version = judgement.version;
-                    ensure!(
-                        version == RowVersion::Resulting,
-                        "Unknown row version {version:?}"
-                    );
+                    let resulting = judgement.version == RowVersion::Resulting;
+                    ensure!(resulting, "Unknown row version {:?}", judgement.version);
                     let row = probe
                         .resulting
                         .context("The statement produces no resulting row")?;
@@ -540,16 +537,15 @@ mod tests {
         openfga_url: &str,
     ) -> Result<()> {
         let schema = std::mem::replace(&mut case.schema, "INVALID SQL".into());
-        ensure!(
-            matches!(
-                Model::create(openfga_url, case, database)?,
-                Prepared::Refused(_)
-            ),
-            "an unparsable schema must be refused"
+        let refused = matches!(
+            Model::create(openfga_url, case, database)?,
+            Prepared::Refused(_)
         );
+        ensure!(refused, "an unparsable schema must be refused");
         case.schema = schema.replace("PRIMARY KEY", "");
-        let Prepared::Ready(model) = Model::create(openfga_url, case, database)? else {
-            bail!("missing row key is an emitted gap");
+        let created = Model::create(openfga_url, case, database)?;
+        let Prepared::Ready(model) = created else {
+            bail!("keyless table refused")
         };
         let row = json!({"id":1,"owner":"alice","body":"a"});
         let probe = Probe {
@@ -559,12 +555,8 @@ mod tests {
         };
         let table = &case.config.tables[0];
         let caller = &case.config.callers[0];
-        ensure!(
-            model
-                .permits(table, caller, ActionStatement::Select, &probe)
-                .is_err(),
-            "a keyless table cannot name the checked row"
-        );
+        let named = model.permits(table, caller, ActionStatement::Select, &probe);
+        ensure!(named.is_err(), "a keyless table must not name the row");
         Ok(())
     }
 }
