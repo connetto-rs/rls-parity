@@ -16,7 +16,7 @@ The SQLite replica runs the statement as `pg2sqlite` translates it, so a clause 
 
 A `[[known]]` entry in `known.toml` identifies each row discrepancy by `case`, `caller`, `row`, `statement`, `engine`, `direction` and `finding`. Directions are `wider`, `narrower`, `different_denial`, `refused` and `error`. `different_denial` marks a write both engines refuse, one by skipping the row and the other by aborting, or with different SQLSTATEs. Unexpected discrepancies and entries that no longer occur fail the run.
 
-An engine answer carrying PostgreSQL's own error, as a runtime error or as a translation refusal, agrees with PostgreSQL. Any other engine error counts as a discrepancy, even when both engines reject the read. An absent replica table reports its SQLite error for every oracle row.
+An engine answer carrying PostgreSQL's own error, as a runtime error or as a translation refusal, agrees with PostgreSQL. Any other engine error counts as a discrepancy, even when both engines reject the read. A read of a table the replica leaves out answers PostgreSQL's privilege error for every oracle row.
 
 Each case also records whether each translator accepts its schema, the way connetto gates it. `pg2sqlite` accepts when it translates the schema for every acting role. `rls2fga` accepts when `Translation::outputs` succeeds, so a note that diverges from the database refuses it, while row comparisons keep running on `outputs_accepting_gaps`. A schema exactly one of them refuses is a discrepancy unless a `[[refusal]]` entry in `known.toml` lists its `case`, the refusing `engine` and the `finding`.
 

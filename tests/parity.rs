@@ -227,7 +227,7 @@ fn fixture_edge_cases(root: &Path, database_url: &str, openfga_url: &str) -> any
     Ok(())
 }
 
-/// A table omitted by the replica remains an error for every oracle row.
+/// A table omitted by the replica answers PostgreSQL's privilege error for every oracle row.
 fn omitted_table_seed_is_skipped(
     root: &Path,
     database_url: &str,
@@ -250,11 +250,11 @@ fn omitted_table_seed_is_skipped(
     assert_eq!(reads.len(), 4);
     for observation in reads {
         assert!(
-            matches!(&observation.postgres, Answer::Error(reason) if reason.contains("permission denied")),
+            matches!(&observation.postgres, Answer::Error(reason) if reason == "permission denied for table docs"),
             "{observation:?}"
         );
         assert!(
-            matches!(&observation.sqlite, Answer::Error(reason) if reason.contains("no such table")),
+            matches!(&observation.sqlite, Answer::Refused(reason) if reason == "permission denied for table docs"),
             "{observation:?}"
         );
     }
