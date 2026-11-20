@@ -35,3 +35,9 @@ cargo llvm-cov report --include-build-script --lcov --output-path lcov.info
 ```
 
 `Cargo.lock` remains local. The runner creates and removes each case database and its roles. Pass `-- --known PATH` to test an alternate known list.
+
+## Generate
+
+`cargo run --release -- generate --seed N --minutes M` draws random cases for `M` minutes. A case has one to three tables with integer, text, `uuid`, `jsonb`, boolean and `timestamptz` columns, grants, role membership, and permissive or restrictive policies for every command over the caller, its subjects, team memberships, flags and constants. Each draw follows from the seed and its index alone. A case with any discrepancy is shrunk and written to `failures/seed{N}-{draw}/`, a case directory that replays once copied into `cases/`.
+
+A `[[construct]]` entry in `known.toml` names a construct tied to a known finding, with its `engine` and `finding`. The generator never produces a listed construct, and removing the entry turns it back on.

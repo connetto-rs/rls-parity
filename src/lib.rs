@@ -1,12 +1,14 @@
 #![doc = include_str!("../README.md")]
 
 mod case;
+mod generator;
 mod openfga;
 mod postgres;
 mod rows;
 mod runner;
 mod sqlite;
 
+pub use generator::{Construct, generate};
 pub use runner::{RunError, observe_cases, read_known};
 
 use std::collections::BTreeSet;
@@ -128,7 +130,16 @@ pub struct KnownRefusal {
     pub finding: String,
 }
 
-/// Every tracked discrepancy, per row and per schema.
+/// A generator construct whose divergence is tracked, so the generator never produces it.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnownConstruct {
+    pub construct: Construct,
+    pub engine: Engine,
+    pub finding: String,
+}
+
+/// Every tracked discrepancy, per row, per schema and per generator construct.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KnownList {
@@ -136,6 +147,8 @@ pub struct KnownList {
     pub known: Vec<Known>,
     #[serde(default)]
     pub refusal: Vec<KnownRefusal>,
+    #[serde(default)]
+    pub construct: Vec<KnownConstruct>,
 }
 
 /// Classify an engine answer against the live oracle.
@@ -319,6 +332,7 @@ mod tests {
                 engine: Engine::Sqlite,
                 finding: "test".into(),
             }],
+            construct: Vec::new(),
         };
         let measured = |sqlite: Option<&str>, openfga: Option<&str>| Measurements {
             acceptances: vec![Acceptance {

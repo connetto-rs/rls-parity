@@ -1,31 +1,75 @@
-use std::{env, io::Write, path::Path};
+use std::{env, io::Write, path::Path, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
-use rls_parity::{KnownList, Measurements, compare, observe_cases, read_known};
+use rls_parity::{KnownList, Measurements, compare, generate, observe_cases, read_known};
 
-/// Compare every case against a live PostgreSQL oracle.
+/// Compare every case against a live PostgreSQL oracle, or generate cases for a while.
 fn main() -> Result<()> {
     println!("{}", env!("DEPENDENCY_REVISIONS"));
     let args: Vec<String> = env::args().skip(1).collect();
-    let known = read_known(known_path(&args)?)?;
+    let command = command(&args)?;
+    let known = read_known(command.known())?;
     let database_url = env::var("DATABASE_URL")
         .context("Set DATABASE_URL to a dedicated PostgreSQL 18 cluster")?;
     let openfga_url = env::var("OPENFGA_URL").context("Set OPENFGA_URL to OpenFGA v1.11.6")?;
-    let measurements = observe_cases(Path::new("cases"), &database_url, &openfga_url)?;
-    report(
-        &measurements,
-        &known,
-        std::io::stdout().lock(),
-        std::io::stderr().lock(),
-    )
+    match command {
+        Command::Compare(_) => {
+            let measurements = observe_cases(Path::new("cases"), &database_url, &openfga_url)?;
+            report(
+                &measurements,
+                &known,
+                std::io::stdout().lock(),
+                std::io::stderr().lock(),
+            )
+        }
+        Command::Generate { seed, minutes } => {
+            let failures = Path::new("failures");
+            let budget = Duration::from_secs(minutes.saturating_mul(60));
+            let failed = generate(seed, budget, &known, &database_url, &openfga_url, failures)?;
+            ensure!(
+                failed == 0,
+                "{failed} generated cases failed, written under {}",
+                failures.display()
+            );
+            Ok(())
+        }
+    }
 }
 
-/// Read the optional alternate known-list path.
-fn known_path(args: &[String]) -> Result<&Path> {
+#[derive(Debug, PartialEq)]
+enum Command<'a> {
+    /// Compare the cases against the known list at this path.
+    Compare(&'a Path),
+    /// Generate cases from `seed` for `minutes`.
+    Generate { seed: u64, minutes: u64 },
+}
+
+impl Command<'_> {
+    /// The known list the command reads.
+    fn known(&self) -> &Path {
+        match self {
+            Self::Compare(path) => path,
+            Self::Generate { .. } => Path::new("known.toml"),
+        }
+    }
+}
+
+/// Read the command and its arguments.
+fn command(args: &[String]) -> Result<Command<'_>> {
     match args {
-        [] => Ok(Path::new("known.toml")),
-        [flag, path] if flag == "--known" => Ok(Path::new(path)),
-        _ => bail!("Usage cargo run -- [--known PATH]"),
+        [] => Ok(Command::Compare(Path::new("known.toml"))),
+        [flag, path] if flag == "--known" => Ok(Command::Compare(Path::new(path))),
+        [generate, seed_flag, seed, minutes_flag, minutes]
+            if generate == "generate" && seed_flag == "--seed" && minutes_flag == "--minutes" =>
+        {
+            Ok(Command::Generate {
+                seed: seed.parse().context("--seed takes an unsigned integer")?,
+                minutes: minutes
+                    .parse()
+                    .context("--minutes takes an unsigned integer")?,
+            })
+        }
+        _ => bail!("Usage cargo run -- [--known PATH] | generate --seed N --minutes M"),
     }
 }
 
@@ -63,19 +107,33 @@ mod tests {
     use super::*;
     use rls_parity::{Answer, Observation};
 
-    /// Argument parsing accepts only an optional known-list path.
+    /// Argument parsing accepts an optional known-list path or the generate command.
     #[test]
-    fn known_list_arguments() -> Result<()> {
-        assert_eq!(known_path(&[])?, Path::new("known.toml"));
+    fn command_arguments() -> Result<()> {
+        let args = |words: &[&str]| {
+            words
+                .iter()
+                .map(|word| (*word).to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(command(&[])?, Command::Compare(Path::new("known.toml")));
+        let other = args(&["--known", "other.toml"]);
+        assert_eq!(command(&other)?, Command::Compare(Path::new("other.toml")));
+        let generate = args(&["generate", "--seed", "7", "--minutes", "30"]);
         assert_eq!(
-            known_path(&["--known".into(), "other.toml".into()])?,
-            Path::new("other.toml")
+            command(&generate)?,
+            Command::Generate {
+                seed: 7,
+                minutes: 30
+            }
         );
-        for args in [
-            vec!["--known".into()],
-            vec!["--unknown".into(), "other.toml".into()],
+        for words in [
+            &["--known"][..],
+            &["--unknown", "other.toml"],
+            &["generate", "--seed", "-1", "--minutes", "30"],
+            &["generate", "--minutes", "30", "--seed", "7"],
         ] {
-            assert!(known_path(&args).is_err());
+            assert!(command(&args(words)).is_err());
         }
         Ok(())
     }

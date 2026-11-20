@@ -1,7 +1,8 @@
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
 use rls_parity::{
-    Answer, Direction, Engine, Known, KnownList, Measurements, compare, observe_cases, read_known,
+    Answer, Direction, Engine, Known, KnownList, Measurements, compare, generate, observe_cases,
+    read_known,
 };
 
 /// Every recorded discrepancy must be necessary and must remain a discrepancy.
@@ -23,6 +24,34 @@ fn live_known_entry_acceptance() {
     removing_each_entry_reports_exactly_that_divergence(&measurements, &mut known);
     stale_agreement_reports_three_answers(&measurements, &mut known);
     fixture_edge_cases(root, &database_url, &openfga_url).expect("edge-case observations");
+    let listed = read_known(&root.join("known.toml")).expect("known discrepancies");
+    generated_failure_replays(root, &database_url, &openfga_url, &listed)
+        .expect("generated observations");
+}
+
+/// The first draw of seed 0 diverges with every construct generated, its written case replays
+/// the divergence, and the listed constructs keep the same draw from diverging.
+fn generated_failure_replays(
+    root: &Path,
+    database_url: &str,
+    openfga_url: &str,
+    known: &KnownList,
+) -> anyhow::Result<()> {
+    let one_draw = Duration::from_millis(1);
+    let directory = tempfile::tempdir_in(root.join("target"))?;
+    let failures = directory.path().join("failures");
+    let unlisted = KnownList::default();
+    let failed = generate(0, one_draw, &unlisted, database_url, openfga_url, &failures)?;
+    assert_eq!(failed, 1);
+    let replayed = observe_cases(&failures, database_url, openfga_url)?;
+    assert_ne!(compare(&replayed, &unlisted), Vec::<String>::new());
+    let listed = directory.path().join("listed");
+    assert_eq!(
+        generate(0, one_draw, known, database_url, openfga_url, &listed)?,
+        0
+    );
+    assert!(!listed.exists());
+    Ok(())
 }
 
 /// Removing a known entry exposes exactly its measured engine disagreement.
