@@ -229,7 +229,7 @@ impl Replica {
     ) -> Result<Prepared<Outcome>> {
         let translated = match self.translate(caller, statement)? {
             Prepared::Ready(translated) => translated,
-            Prepared::Refused(reason) => return Ok(Prepared::Refused(reason)),
+            Prepared::Refused(reason) => return Ok(refused_write(reason)),
         };
         self.connection.batch_execute("SAVEPOINT probe")?;
         let result = (|| {
@@ -272,6 +272,15 @@ impl Replica {
                 Err(error) => Prepared::Refused(error.to_string()),
             },
         )
+    }
+}
+
+/// A write pg2sqlite refuses to translate, read as the SQLSTATE PostgreSQL raises when the
+/// refusal is one of its errors.
+fn refused_write(reason: String) -> Prepared<Outcome> {
+    match postgres_error(&reason).map(|error| error.sqlstate().to_string()) {
+        Some(sqlstate) => Prepared::Ready(Outcome::Rejected(sqlstate)),
+        None => Prepared::Refused(reason),
     }
 }
 
@@ -404,5 +413,19 @@ mod tests {
         };
         assert_eq!(minted, (expected(1), expected(2)));
         Ok(())
+    }
+
+    /// A write's translation refusal carrying a PostgreSQL error answers its SQLSTATE, and
+    /// any other refusal stays a refusal.
+    #[test]
+    fn refused_write_answers_postgres_errors() {
+        assert!(matches!(
+            refused_write("permission denied for table docs".into()),
+            Prepared::Ready(Outcome::Rejected(sqlstate)) if sqlstate == "42501"
+        ));
+        assert!(matches!(
+            refused_write("Unsupported SQLite feature: write-only column".into()),
+            Prepared::Refused(reason) if reason == "Unsupported SQLite feature: write-only column"
+        ));
     }
 }
