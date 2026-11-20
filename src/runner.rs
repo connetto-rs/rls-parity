@@ -5,12 +5,13 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
+use rls2fga::types::ActionStatement;
 use serde_json::Value;
 
 use crate::{
     Acceptance, Answer, KnownList, Measurements, Observation, Outcome, Prepared,
     case::{Caller, Case, Shape, Table, Write, identifier},
-    openfga::{Model, Probe},
+    openfga::{Model, Probe, Verdict},
     postgres::Database,
     sqlite::Replica,
 };
@@ -186,8 +187,8 @@ fn measure_reads(
                     Prepared::Refused(reason) => Answer::Refused(reason.clone()),
                     Prepared::Ready(model) => {
                         match model.permits(table, caller, shape.action(), &probe) {
-                            Ok(true) => Answer::Visible,
-                            Ok(false) => Answer::Hidden,
+                            Ok(Verdict::Changed) => Answer::Visible,
+                            Ok(Verdict::Skipped | Verdict::Aborted) => Answer::Hidden,
                             Err(error) => Answer::Error(format!("{error:#}")),
                         }
                     }
@@ -224,25 +225,21 @@ fn measure_write(
             let sqlite = on_replica(role_replica(&mut engines.replicas, caller)?, |replica| {
                 replica.write(table, caller_index, &target.statement)
             });
-            for row in &target.rows {
-                let sqlite_answer = match &sqlite {
-                    Err(reason) => Answer::Refused(reason.clone()),
-                    Ok(outcome) => written(outcome, &row.key),
-                };
-                let probe = Probe {
+            let probes: Vec<Probe> = target
+                .rows
+                .iter()
+                .map(|row| Probe {
                     existing: row.existing,
                     resulting: row.resulting.as_ref(),
                     columns: columns.clone(),
-                };
-                let openfga_answer = match &engines.model {
-                    Prepared::Refused(reason) => Answer::Refused(reason.clone()),
-                    Prepared::Ready(model) => {
-                        match model.permits(table, caller, write.shape.action(), &probe) {
-                            Ok(true) => Answer::Changed,
-                            Ok(false) => Answer::Denied,
-                            Err(error) => Answer::Error(format!("{error:#}")),
-                        }
-                    }
+                })
+                .collect();
+            let openfga =
+                openfga_answers(&engines.model, table, caller, write.shape.action(), &probes);
+            for (row, openfga_answer) in target.rows.iter().zip(openfga) {
+                let sqlite_answer = match &sqlite {
+                    Err(reason) => Answer::Refused(reason.clone()),
+                    Ok(outcome) => written(outcome, &row.key),
                 };
                 observations.push(Observation {
                     case: case.name.clone(),
@@ -257,6 +254,37 @@ fn measure_write(
         }
     }
     Ok(observations)
+}
+
+/// `OpenFGA`'s answer for each row one statement reaches, one probe per row. PostgreSQL
+/// aborts the whole statement when a row it reaches fails a check on the row it would
+/// produce, so such a row denies every row of the statement.
+fn openfga_answers(
+    model: &Prepared<Model>,
+    table: &Table,
+    caller: &Caller,
+    action: ActionStatement,
+    probes: &[Probe],
+) -> Vec<Answer> {
+    let model = match model {
+        Prepared::Refused(reason) => return vec![Answer::Refused(reason.clone()); probes.len()],
+        Prepared::Ready(model) => model,
+    };
+    let verdicts: Vec<Result<Verdict>> = probes
+        .iter()
+        .map(|probe| model.permits(table, caller, action, probe))
+        .collect();
+    let aborted = verdicts
+        .iter()
+        .any(|verdict| matches!(verdict, Ok(Verdict::Aborted)));
+    verdicts
+        .into_iter()
+        .map(|verdict| match verdict {
+            Ok(Verdict::Changed) if !aborted => Answer::Changed,
+            Ok(_) => Answer::Denied,
+            Err(error) => Answer::Error(format!("{error:#}")),
+        })
+        .collect()
 }
 
 /// Each translator's verdict on the case's schema, the way connetto gates it. `pg2sqlite`

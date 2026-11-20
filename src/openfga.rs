@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use diesel::prelude::*;
 use reqwest::{Method, blocking::Client};
 use rls2fga::{
@@ -34,6 +34,19 @@ pub(crate) struct Probe<'a> {
     pub resulting: Option<&'a Value>,
     /// The columns the statement touches under each column command.
     pub columns: BTreeMap<ColumnCommand, Vec<String>>,
+}
+
+/// What `OpenFGA` answers for one row of a statement, split the way PostgreSQL acts on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Verdict {
+    /// Every judgement holds, so the statement changes or reads the row.
+    Changed,
+    /// A judgement about the stored row fails, so the statement leaves the row alone,
+    /// as a `USING` clause filters it.
+    Skipped,
+    /// The stored row passes but a judgement about the row the statement produces, or a
+    /// column privilege, fails, so PostgreSQL aborts the whole statement.
+    Aborted,
 }
 
 /// A delimited set setting and the condition parameter its values travel under.
@@ -149,7 +162,7 @@ impl Model {
         caller: &Caller,
         action: ActionStatement,
         probe: &Probe,
-    ) -> Result<bool> {
+    ) -> Result<Verdict> {
         let naming = self
             .outputs
             .translation()
@@ -175,54 +188,59 @@ impl Model {
         self.answer(&entry.answer, existing.as_deref(), probe, caller)
     }
 
-    /// Interpret the translation's action answer without inferring relations.
+    /// Interpret the translation's action answer without inferring relations. The stored
+    /// row's judgements are asked first, since a row they filter is never checked further.
     fn answer(
         &self,
         answer: &ActionAnswer,
         existing: Option<&str>,
         probe: &Probe,
         caller: &Caller,
-    ) -> Result<bool> {
+    ) -> Result<Verdict> {
         match answer {
-            ActionAnswer::Unrestricted => Ok(true),
-            ActionAnswer::Denied => Ok(false),
+            ActionAnswer::Unrestricted => Ok(Verdict::Changed),
+            ActionAnswer::Denied => Ok(Verdict::Skipped),
             ActionAnswer::Judged(judgements) => {
-                for judgement in judgements {
-                    let relation = judgement.relation.as_str();
-                    let granted = match judgement.version {
-                        RowVersion::Existing => {
-                            let object = existing.context("The statement reaches no stored row")?;
-                            self.check(relation, object, caller, &[])?
-                        }
-                        RowVersion::Resulting => {
-                            let row = probe
-                                .resulting
-                                .context("The statement produces no resulting row")?;
-                            let resulting = self
-                                .outputs
-                                .translation()
-                                .resulting_rows()
-                                .iter()
-                                .find(|resulting| resulting.type_name == judgement.type_name)
-                                .context("Translation names no resulting row for the judgement")?;
-                            let object = resulting
-                                .object(&Row(row))?
-                                .context("Resulting row has no OpenFGA object name")?;
-                            let records: Vec<Value> =
-                                resulting.records(&Row(row))?.iter().map(tuple).collect();
-                            self.check(relation, &object, caller, &records)?
-                        }
-                        other => bail!("Unsupported row version {other:?}"),
-                    };
-                    if !granted {
-                        return Ok(false);
+                let (stored, produced): (Vec<_>, Vec<_>) = judgements
+                    .iter()
+                    .partition(|judgement| judgement.version == RowVersion::Existing);
+                for judgement in stored {
+                    let object = existing.context("The statement reaches no stored row")?;
+                    if !self.check(judgement.relation.as_str(), object, caller, &[])? {
+                        return Ok(Verdict::Skipped);
                     }
                 }
-                Ok(true)
+                for judgement in produced {
+                    let version = judgement.version;
+                    ensure!(
+                        version == RowVersion::Resulting,
+                        "Unknown row version {version:?}"
+                    );
+                    let row = probe
+                        .resulting
+                        .context("The statement produces no resulting row")?;
+                    let resulting = self
+                        .outputs
+                        .translation()
+                        .resulting_rows()
+                        .iter()
+                        .find(|resulting| resulting.type_name == judgement.type_name)
+                        .context("Translation names no resulting row for the judgement")?;
+                    let object = resulting
+                        .object(&Row(row))?
+                        .context("Resulting row has no OpenFGA object name")?;
+                    let records: Vec<Value> =
+                        resulting.records(&Row(row))?.iter().map(tuple).collect();
+                    if !self.check(judgement.relation.as_str(), &object, caller, &records)? {
+                        return Ok(Verdict::Aborted);
+                    }
+                }
+                Ok(Verdict::Changed)
             }
             ActionAnswer::ByColumn(columns) => {
-                if !self.answer(&columns.rows, existing, probe, caller)? {
-                    return Ok(false);
+                let rows = self.answer(&columns.rows, existing, probe, caller)?;
+                if rows != Verdict::Changed {
+                    return Ok(rows);
                 }
                 for command in &columns.commands {
                     let touched = probe.columns.get(&command.command).with_context(|| {
@@ -236,11 +254,11 @@ impl Model {
                             caller,
                             &[],
                         )? {
-                            return Ok(false);
+                            return Ok(Verdict::Aborted);
                         }
                     }
                 }
-                Ok(true)
+                Ok(Verdict::Changed)
             }
             other => Err(anyhow!("Unsupported action answer {other:?}")),
         }
@@ -443,13 +461,28 @@ mod tests {
             columns: case.config.tables[0].read_columns(),
         };
         let table = &case.config.tables[0];
-        assert!(model.permits(table, caller, select, &read(&case))?);
-        assert!(!model.permits(table, &case.config.callers[1], select, &read(&case))?);
+        assert_eq!(
+            model.permits(table, caller, select, &read(&case))?,
+            Verdict::Changed
+        );
+        assert_eq!(
+            model.permits(table, &case.config.callers[1], select, &read(&case))?,
+            Verdict::Skipped
+        );
         case.config.tables[0].columns.push("body".into());
         let probe = read(&case);
-        assert!(!model.permits(&case.config.tables[0], caller, select, &probe)?);
-        assert!(model.answer(&ActionAnswer::Unrestricted, Some("docs:1"), &probe, caller)?);
-        assert!(!model.answer(&ActionAnswer::Denied, Some("docs:1"), &probe, caller)?);
+        assert_eq!(
+            model.permits(&case.config.tables[0], caller, select, &probe)?,
+            Verdict::Aborted
+        );
+        assert_eq!(
+            model.answer(&ActionAnswer::Unrestricted, Some("docs:1"), &probe, caller)?,
+            Verdict::Changed
+        );
+        assert_eq!(
+            model.answer(&ActionAnswer::Denied, Some("docs:1"), &probe, caller)?,
+            Verdict::Skipped
+        );
         let resulting = ActionAnswer::Judged(vec![rls2fga::types::ActionJudgement::new(
             RelationName::canonicalized("owner"),
             RowVersion::Resulting,
@@ -494,24 +527,43 @@ mod tests {
             .expect_err("incomplete check");
         assert!(error.to_string().contains("400 Bad Request"), "{error}");
         model.cleanup()?;
+        refused_and_keyless_models(&mut case, &mut database, &openfga_url)
+    }
+
+    /// Checks that a schema the parser rejects is refused, and that a table without a row
+    /// key translates but cannot name the row a check asks about.
+    ///
+    /// Runs on the caller's database because case roles are cluster-wide.
+    fn refused_and_keyless_models(
+        case: &mut Case,
+        database: &mut Database,
+        openfga_url: &str,
+    ) -> Result<()> {
         let schema = std::mem::replace(&mut case.schema, "INVALID SQL".into());
-        assert!(matches!(
-            Model::create(&openfga_url, &case, &mut database)?,
-            Prepared::Refused(_)
-        ));
+        ensure!(
+            matches!(
+                Model::create(openfga_url, case, database)?,
+                Prepared::Refused(_)
+            ),
+            "an unparsable schema must be refused"
+        );
         case.schema = schema.replace("PRIMARY KEY", "");
-        let Prepared::Ready(model) = Model::create(&openfga_url, &case, &mut database)? else {
-            panic!("missing row key is an emitted gap");
+        let Prepared::Ready(model) = Model::create(openfga_url, case, database)? else {
+            bail!("missing row key is an emitted gap");
         };
-        assert!(
+        let row = json!({"id":1,"owner":"alice","body":"a"});
+        let probe = Probe {
+            existing: Some(&row),
+            resulting: None,
+            columns: case.config.tables[0].read_columns(),
+        };
+        let table = &case.config.tables[0];
+        let caller = &case.config.callers[0];
+        ensure!(
             model
-                .permits(
-                    &case.config.tables[0],
-                    &case.config.callers[0],
-                    select,
-                    &read(&case)
-                )
-                .is_err()
+                .permits(table, caller, ActionStatement::Select, &probe)
+                .is_err(),
+            "a keyless table cannot name the checked row"
         );
         Ok(())
     }
