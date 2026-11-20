@@ -48,11 +48,6 @@ construct = "membership_under_rls"
 engine = "openfga"
 finding = "8, rls2fga refuses a membership table under its own row level security, which the replica translates"
 
-[[construct]]
-construct = "jsonb_scalar_extraction"
-engine = "sqlite"
-finding = "7, JSON numeric and boolean extraction returns an integer instead of text"
-
 [[refusal]]
 case = "membership_under_rls"
 engine = "openfga"
@@ -62,24 +57,6 @@ finding = "8, rls2fga refuses a membership table under its own row level securit
 case = "partitioned"
 engine = "sqlite"
 finding = "8, SQLite translation refuses partitioned tables, which rls2fga accepts"
-
-[[known]]
-case = "jsonb_numeric_owner"
-caller = "seven"
-row = "jdocs:1"
-statement = 'SELECT "id" FROM "jdocs"'
-engine = "sqlite"
-direction = "narrower"
-finding = "7, JSON numeric extraction returns an integer instead of text"
-
-[[known]]
-case = "jsonb_numeric_owner"
-caller = "true"
-row = "jdocs:3"
-statement = 'SELECT "id" FROM "jdocs"'
-engine = "sqlite"
-direction = "narrower"
-finding = "7, JSON boolean extraction returns an integer instead of text"
 
 [[known]]
 case = "partitioned"
