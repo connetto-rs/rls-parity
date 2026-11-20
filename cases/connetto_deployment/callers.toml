@@ -62,10 +62,17 @@ name = "bot_reader"
 role = "connetto_reader"
 settings = { "app.user_id" = "alice", "app.subjects" = "", "app.bot_list" = "orders:read,order_lines:read,photos:read,products:read,teams:read,team_members:read,team_notes:read,users:read" }
 
+# A write's checks read other tables through their own cap_read, so write caps alone refuse every write.
 [[callers]]
 name = "bot_writer"
 role = "connetto_reader"
 settings = { "app.user_id" = "alice", "app.subjects" = "", "app.bot_list" = "orders:update,order_lines:update,photos:insert,photos:update,photos:delete,team_notes:insert" }
+
+# The same write caps with the reads their WHERE clauses and checks need.
+[[callers]]
+name = "bot_editor"
+role = "connetto_reader"
+settings = { "app.user_id" = "alice", "app.subjects" = "", "app.bot_list" = "orders:read,order_lines:read,photos:read,team_members:read,orders:update,order_lines:update,photos:insert,photos:update,photos:delete,team_notes:insert" }
 
 [[callers]]
 name = "bot_unlisted"
