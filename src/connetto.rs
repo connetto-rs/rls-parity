@@ -7,18 +7,12 @@ use pg2sqlite::prelude::Pg2SqliteOptions;
 use sql_traits::prelude::Deployment;
 
 /// The demo's catalog as connetto's server reads it: the schema with the bot registry
-/// connetto appends, the roles, the policies, and the cap policies connetto adds.
+/// connetto appends, the roles, the policies, and the cap policies connetto adds, each
+/// document ending in its own `;`.
 pub(crate) fn schema() -> Result<String> {
     let cap = connetto_schema::cap_policies::<TextIds>(SCHEMA_SQL, POLICIES_SQL)?;
-    let mut sql = connetto_schema::with_registry::<TextIds>(SCHEMA_SQL);
-    for document in [ROLES_SQL, POLICIES_SQL, cap.as_str()] {
-        if !sql.trim_end().ends_with(';') {
-            sql.push(';');
-        }
-        sql.push('\n');
-        sql.push_str(document);
-    }
-    Ok(sql)
+    let registry = connetto_schema::with_registry::<TextIds>(SCHEMA_SQL);
+    Ok([registry.as_str(), ROLES_SQL, POLICIES_SQL, cap.as_str()].join("\n"))
 }
 
 /// The deployment connetto gives both translators, acting as the reader role.

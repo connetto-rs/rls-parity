@@ -340,7 +340,7 @@ mod tests {
     use std::path::Path;
 
     /// Registered session functions follow the caller, read a setting the caller leaves
-    /// unset as `NULL`, and leave writes unexempted.
+    /// unset as `NULL`, leave writes unexempted, and mint version 4 UUIDs numbered from one.
     #[test]
     fn caller_session_functions() -> Result<()> {
         let mut case =
@@ -392,6 +392,16 @@ mod tests {
             Replica::create(&case, &role)?,
             Prepared::Refused(_)
         ));
+        let minted = diesel::select((uuidv4(), uuidv4()))
+            .get_result::<(Vec<u8>, Vec<u8>)>(&mut replica.connection)?;
+        let expected = |number: u8| {
+            let mut bytes = vec![0; 16];
+            bytes[6] = 0x40;
+            bytes[8] = 0x80;
+            bytes[15] = number;
+            bytes
+        };
+        assert_eq!(minted, (expected(1), expected(2)));
         Ok(())
     }
 }

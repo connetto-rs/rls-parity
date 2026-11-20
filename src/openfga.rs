@@ -73,18 +73,12 @@ impl Model {
                 }) => Some((setting.name(), delimiter)),
                 _ => None,
             })
-            .map(|(setting, delimiter)| {
-                let parameter = serde_json::to_value(ConditionParameterName::derived(setting))?;
-                Ok(SetParameter {
-                    setting: setting.to_owned(),
-                    parameter: parameter
-                        .as_str()
-                        .context("A condition parameter is not text")?
-                        .to_owned(),
-                    delimiter: delimiter.clone(),
-                })
+            .map(|(setting, delimiter)| SetParameter {
+                setting: setting.to_owned(),
+                parameter: ConditionParameterName::derived(setting).into(),
+                delimiter: delimiter.clone(),
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Vec<_>>();
         let translation = match TranslatorBuilder::new(deployment)
             .with_min_confidence(ConfidenceLevel::B)
             .build()

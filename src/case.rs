@@ -242,7 +242,7 @@ impl Config {
     /// a caller names, and the connetto case takes connetto's own.
     pub fn deployment(&self) -> Result<Deployment> {
         match self.source {
-            Source::Files => Ok(Deployment::new(
+            Source::Files => Deployment::new(
                 &self.callers[0].role,
                 self.acting_roles(),
                 [
@@ -255,7 +255,8 @@ impl Config {
                         },
                     )?,
                 ],
-            )?),
+            )
+            .map_err(Into::into),
             Source::Connetto => connetto::deployment(),
         }
     }
