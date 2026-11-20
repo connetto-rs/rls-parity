@@ -1,18 +1,17 @@
 use std::{
-    borrow::Cow,
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, ensure};
-use serde::Deserialize;
+use rls2fga::types::ActionStatement;
 use serde_json::Value;
 
 use crate::{
-    Answer, Known, Observation, Prepared,
-    case::{Case, identifier},
-    openfga::Model,
+    Acceptance, Answer, KnownList, Measurements, Observation, Outcome, Prepared,
+    case::{Caller, Case, Shape, Table, Write, identifier},
+    openfga::{Model, Probe, Verdict},
     postgres::Database,
     sqlite::Replica,
 };
@@ -42,26 +41,19 @@ pub enum RunError {
     },
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct KnownFile {
-    known: Vec<Known>,
-}
-
 /// Read the exact known-discrepancy list.
 ///
 /// # Errors
 /// Returns the path and cause when the file cannot be read or decoded.
-pub fn read_known(path: &Path) -> std::result::Result<Vec<Known>, RunError> {
+pub fn read_known(path: &Path) -> std::result::Result<KnownList, RunError> {
     let text = fs::read_to_string(path).map_err(|source| RunError::Io {
         path: path.into(),
         source,
     })?;
-    let file: KnownFile = toml::from_str(&text).map_err(|source| RunError::InvalidKnown {
+    toml::from_str(&text).map_err(|source| RunError::InvalidKnown {
         path: path.into(),
         source,
-    })?;
-    Ok(file.known)
+    })
 }
 
 /// Collect live three-engine observations independently of the known list.
@@ -72,7 +64,7 @@ pub fn observe_cases(
     root: &Path,
     database_url: &str,
     openfga_url: &str,
-) -> std::result::Result<Vec<Observation>, RunError> {
+) -> std::result::Result<Measurements, RunError> {
     let directories = fs::read_dir(root)
         .and_then(|entries| {
             entries
@@ -88,70 +80,352 @@ pub fn observe_cases(
     }
     let mut directories = directories;
     directories.sort();
-    let mut observations = Vec::new();
+    let mut measurements = Measurements::default();
     for directory in directories {
-        observations.extend(
+        let (acceptance, observations) =
             run_case(&directory, database_url, openfga_url).map_err(|source| RunError::Case {
                 path: directory,
                 source,
-            })?,
+            })?;
+        measurements.acceptances.push(acceptance);
+        measurements.observations.extend(observations);
+    }
+    Ok(measurements)
+}
+
+/// Measure whether each translator accepts the schema, then every caller and seeded row
+/// of every table, before evaluating the known list.
+fn run_case(
+    path: &Path,
+    database_url: &str,
+    openfga_url: &str,
+) -> Result<(Acceptance, Vec<Observation>)> {
+    let case = Case::read(path)?;
+    let mut database =
+        Database::create(database_url, &case).with_context(|| format!("Creating {}", case.name))?;
+    let mut rows = BTreeMap::new();
+    for table in &case.config.tables {
+        let seeded = database.rows(&identifier(&table.name))?;
+        ensure!(
+            !seeded.is_empty(),
+            "{} has no seeded rows in {}",
+            case.name,
+            table.name
         );
+        rows.insert(table.name.clone(), seeded);
+    }
+    let replicas = replicas(&case)?;
+    let model = Model::create(openfga_url, &case, &mut database)
+        .with_context(|| format!("Loading OpenFGA for {}", case.name))?;
+    let acceptance = acceptance(&case, &replicas, &model);
+    let mut engines = Engines {
+        database,
+        replicas,
+        model,
+    };
+    let mut observations = Vec::new();
+    for table in &case.config.tables {
+        observations.extend(measure_reads(
+            &case,
+            table,
+            &rows[&table.name],
+            &mut engines,
+        )?);
+    }
+    for write in case.writes() {
+        let table = case.table(&write.table)?;
+        observations.extend(measure_write(
+            &case,
+            table,
+            write,
+            &rows[&table.name],
+            &mut engines,
+        )?);
+    }
+    if let Prepared::Ready(mut model) = engines.model {
+        model.cleanup()?;
+    }
+    engines.database.cleanup()?;
+    Ok((acceptance, observations))
+}
+
+/// The three engines one case is measured on.
+struct Engines {
+    database: Database,
+    replicas: BTreeMap<String, Prepared<Replica>>,
+    model: Prepared<Model>,
+}
+
+/// Measure every read shape on `table` for every caller and seeded row.
+fn measure_reads(
+    case: &Case,
+    table: &Table,
+    rows: &[Value],
+    engines: &mut Engines,
+) -> Result<Vec<Observation>> {
+    let mut observations = Vec::new();
+    let read_columns = table.read_columns();
+    for shape in case.reads(table) {
+        let statement = table.statement(shape);
+        for (caller_index, caller) in case.config.callers.iter().enumerate() {
+            let postgres = engines.database.visible(table, caller, &statement);
+            let sqlite = on_replica(role_replica(&mut engines.replicas, caller)?, |replica| {
+                replica.visible(table, caller_index, &statement)
+            });
+            for row in rows {
+                let key = table.row_key(|column| row.get(column))?;
+                let sqlite_answer = match &sqlite {
+                    Err(reason) => Answer::Refused(reason.clone()),
+                    Ok(answer) => visibility(answer, &key),
+                };
+                let probe = Probe {
+                    existing: Some(row),
+                    resulting: None,
+                    columns: read_columns.clone(),
+                };
+                let openfga_answer = match &engines.model {
+                    Prepared::Refused(reason) => Answer::Refused(reason.clone()),
+                    Prepared::Ready(model) => {
+                        match model.permits(table, caller, shape.action(), &probe) {
+                            Ok(Verdict::Changed) => Answer::Visible,
+                            Ok(Verdict::Skipped | Verdict::Aborted) => Answer::Hidden,
+                            Err(error) => Answer::Error(format!("{error:#}")),
+                        }
+                    }
+                };
+                observations.push(Observation {
+                    case: case.name.clone(),
+                    caller: caller.name.clone(),
+                    row: format!("{}:{key}", table.name),
+                    statement: statement.clone(),
+                    postgres: visibility(&postgres, &key),
+                    sqlite: sqlite_answer,
+                    openfga: openfga_answer,
+                });
+            }
+        }
     }
     Ok(observations)
 }
 
-/// Measure every caller and seeded row before evaluating the known list.
-fn run_case(path: &Path, database_url: &str, openfga_url: &str) -> Result<Vec<Observation>> {
-    let case = Case::read(path)?;
-    let mut database =
-        Database::create(database_url, &case).with_context(|| format!("Creating {}", case.name))?;
-    let rows = database.rows(&identifier(&case.config.table))?;
-    ensure!(!rows.is_empty(), "{} has no seeded rows", case.name);
-    let mut replica =
-        Replica::create(&case).with_context(|| format!("Loading SQLite for {}", case.name))?;
-    let model = Model::create(openfga_url, &case, &mut database)
-        .with_context(|| format!("Loading OpenFGA for {}", case.name))?;
+/// Measure `write` on `table` for every caller and the rows it reaches.
+fn measure_write(
+    case: &Case,
+    table: &Table,
+    write: &Write,
+    rows: &[Value],
+    engines: &mut Engines,
+) -> Result<Vec<Observation>> {
     let mut observations = Vec::new();
+    let targets = targets(table, write, rows, &mut engines.database)?;
+    let columns = write.columns(&table.key);
     for (caller_index, caller) in case.config.callers.iter().enumerate() {
-        let postgres = database.visible(&case, caller);
-        let sqlite = match &mut replica {
-            Prepared::Ready(replica) => Ok(replica.visible(&case, caller_index)),
-            Prepared::Refused(reason) => Err(reason.as_str()),
-        };
-        for row in &rows {
-            let key = row.get(&case.config.key).context("Seeded row has no key")?;
-            let key = match key {
-                Value::String(key) => Cow::Borrowed(key.as_str()),
-                other => Cow::Owned(other.to_string()),
-            };
-            let sqlite_answer = match &sqlite {
-                Err(reason) => Answer::Refused((*reason).to_owned()),
-                Ok(answer) => visibility(answer, &key),
-            };
-            let openfga_answer = match &model {
-                Prepared::Refused(reason) => Answer::Refused(reason.clone()),
-                Prepared::Ready(model) => match model.visible(&case, caller, row) {
-                    Ok(true) => Answer::Visible,
-                    Ok(false) => Answer::Hidden,
-                    Err(error) => Answer::Error(format!("{error:#}")),
-                },
-            };
-            observations.push(Observation {
-                case: case.name.clone(),
-                caller: caller.name.clone(),
-                row: format!("{}:{key}", case.config.table),
-                statement: case.statement(),
-                postgres: visibility(&postgres, &key),
-                sqlite: sqlite_answer,
-                openfga: openfga_answer,
+        for target in &targets {
+            let postgres = engines.database.write(table, caller, &target.statement);
+            let sqlite = on_replica(role_replica(&mut engines.replicas, caller)?, |replica| {
+                replica.write(table, caller_index, &target.statement)
             });
+            let probes: Vec<Probe> = target
+                .rows
+                .iter()
+                .map(|row| Probe {
+                    existing: row.existing,
+                    resulting: row.resulting.as_ref(),
+                    columns: columns.clone(),
+                })
+                .collect();
+            let openfga =
+                openfga_answers(&engines.model, table, caller, write.shape.action(), &probes);
+            for (row, openfga_answer) in target.rows.iter().zip(openfga) {
+                let sqlite_answer = match &sqlite {
+                    Err(reason) => Answer::Refused(reason.clone()),
+                    Ok(outcome) => written(outcome, &row.key),
+                };
+                observations.push(Observation {
+                    case: case.name.clone(),
+                    caller: caller.name.clone(),
+                    row: format!("{}:{}", table.name, row.key),
+                    statement: target.statement.clone(),
+                    postgres: written(&postgres, &row.key),
+                    sqlite: sqlite_answer,
+                    openfga: openfga_answer,
+                });
+            }
         }
     }
-    if let Prepared::Ready(mut model) = model {
-        model.cleanup()?;
-    }
-    database.cleanup()?;
     Ok(observations)
+}
+
+/// `OpenFGA`'s answer for each row one statement reaches, one probe per row. PostgreSQL
+/// aborts the whole statement when a row it reaches fails a check on the row it would
+/// produce, so such a row denies every row of the statement.
+fn openfga_answers(
+    model: &Prepared<Model>,
+    table: &Table,
+    caller: &Caller,
+    action: ActionStatement,
+    probes: &[Probe],
+) -> Vec<Answer> {
+    let model = match model {
+        Prepared::Refused(reason) => return vec![Answer::Refused(reason.clone()); probes.len()],
+        Prepared::Ready(model) => model,
+    };
+    let verdicts: Vec<Result<Verdict>> = probes
+        .iter()
+        .map(|probe| model.permits(table, caller, action, probe))
+        .collect();
+    let aborted = verdicts
+        .iter()
+        .any(|verdict| matches!(verdict, Ok(Verdict::Aborted)));
+    verdicts
+        .into_iter()
+        .map(|verdict| match verdict {
+            Ok(Verdict::Changed) if !aborted => Answer::Changed,
+            Ok(_) => Answer::Denied,
+            Err(error) => Answer::Error(format!("{error:#}")),
+        })
+        .collect()
+}
+
+/// Each translator's verdict on the case's schema, the way connetto gates it. `pg2sqlite`
+/// refuses the schema when it refuses any acting role's translation.
+fn acceptance(
+    case: &Case,
+    replicas: &BTreeMap<String, Prepared<Replica>>,
+    model: &Prepared<Model>,
+) -> Acceptance {
+    let refusals: Vec<String> = replicas
+        .iter()
+        .filter_map(|(role, replica)| match replica {
+            Prepared::Ready(_) => None,
+            Prepared::Refused(reason) => Some(format!("{role}: {reason}")),
+        })
+        .collect();
+    Acceptance {
+        case: case.name.clone(),
+        sqlite: (!refusals.is_empty()).then(|| refusals.join("\n")),
+        openfga: match model {
+            Prepared::Ready(model) => model.divergence().map(ToOwned::to_owned),
+            Prepared::Refused(reason) => Some(reason.clone()),
+        },
+    }
+}
+
+/// The replica `pg2sqlite` translated for the caller's acting role.
+fn role_replica<'replicas>(
+    replicas: &'replicas mut BTreeMap<String, Prepared<Replica>>,
+    caller: &Caller,
+) -> Result<&'replicas mut Prepared<Replica>> {
+    replicas
+        .get_mut(&caller.role)
+        .context("No replica for the caller's acting role")
+}
+
+/// Translate one replica per acting role the callers name.
+fn replicas(case: &Case) -> Result<BTreeMap<String, Prepared<Replica>>> {
+    case.config
+        .acting_roles()
+        .into_iter()
+        .map(|role| {
+            let replica = Replica::create(case, role)
+                .with_context(|| format!("Loading SQLite for {} acting as {role}", case.name))?;
+            Ok((role.to_owned(), replica))
+        })
+        .collect()
+}
+
+/// One write statement a caller runs and the rows it answers for.
+struct Target<'a> {
+    statement: String,
+    rows: Vec<TargetRow<'a>>,
+}
+
+struct TargetRow<'a> {
+    key: String,
+    /// The seeded row the statement reaches, absent for an insert.
+    existing: Option<&'a Value>,
+    /// The row the table owner's run of the statement produces, absent for a delete.
+    resulting: Option<Value>,
+}
+
+/// Spell `write` on `table` per seeded row, or once for the table when it names no row.
+fn targets<'a>(
+    table: &Table,
+    write: &Write,
+    rows: &'a [Value],
+    database: &mut Database,
+) -> Result<Vec<Target<'a>>> {
+    let key_of = |row: &Value| table.row_key(|column| row.get(column));
+    match write.shape {
+        Shape::Insert => {
+            let key = table.row_key(|column| write.row.get(column))?;
+            Ok(vec![Target {
+                statement: table.write_statement(write, None),
+                rows: vec![TargetRow {
+                    key,
+                    existing: None,
+                    resulting: database.resulting(&table.resulting_statement(write, None))?,
+                }],
+            }])
+        }
+        Shape::UpdateWithoutWhere => {
+            let mut target_rows = Vec::new();
+            for row in rows {
+                target_rows.push(TargetRow {
+                    key: key_of(row)?,
+                    existing: Some(row),
+                    resulting: database.resulting(&table.resulting_statement(write, Some(row)))?,
+                });
+            }
+            Ok(vec![Target {
+                statement: table.write_statement(write, None),
+                rows: target_rows,
+            }])
+        }
+        _ => rows
+            .iter()
+            .map(|row| {
+                let key = key_of(row)?;
+                let resulting = if write.shape == Shape::Delete {
+                    None
+                } else {
+                    database.resulting(&table.resulting_statement(write, Some(row)))?
+                };
+                Ok(Target {
+                    statement: table.write_statement(write, Some(row)),
+                    rows: vec![TargetRow {
+                        key,
+                        existing: Some(row),
+                        resulting,
+                    }],
+                })
+            })
+            .collect(),
+    }
+}
+
+/// Run `measure` on a loaded replica, `Err` holding why pg2sqlite refused the schema or
+/// the statement and the inner error an execution failure.
+fn on_replica<T>(
+    replica: &mut Prepared<Replica>,
+    measure: impl FnOnce(&mut Replica) -> Result<Prepared<T>>,
+) -> std::result::Result<Result<T>, String> {
+    match replica {
+        Prepared::Ready(replica) => match measure(replica) {
+            Ok(Prepared::Ready(value)) => Ok(Ok(value)),
+            Ok(Prepared::Refused(reason)) => Err(reason),
+            Err(error) => Ok(Err(error)),
+        },
+        Prepared::Refused(reason) => Err(reason.clone()),
+    }
+}
+
+/// Preserve an execution error independently of a write the policies refused.
+fn written(outcome: &Result<Outcome>, key: &str) -> Answer {
+    match outcome {
+        Ok(outcome) => outcome.answer(key),
+        Err(error) => Answer::Error(format!("{error:#}")),
+    }
 }
 
 /// Preserve an execution error independently of a policy denying visibility.

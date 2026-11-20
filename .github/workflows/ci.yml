@@ -107,6 +107,7 @@ jobs:
       - run: cargo update
       - run: nice -n 10 cargo llvm-cov -p rls-parity --all-targets --no-report
       - run: nice -n 10 cargo llvm-cov run -p rls-parity --no-report
+      - run: nice -n 10 cargo llvm-cov run -p rls-parity --no-report -- generate --seed 0 --minutes 0
       - run: cargo llvm-cov report -p rls-parity --include-build-script --lcov --output-path lcov.info
       - name: Upload coverage
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7

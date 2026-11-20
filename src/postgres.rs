@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     io::Write,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -8,12 +8,16 @@ use anyhow::{Context, Result, ensure};
 use diesel::{
     connection::SimpleConnection,
     prelude::*,
+    result::Error as DieselError,
     sql_types::{Bool, Jsonb, Text},
 };
 use serde_json::Value;
 use sqlparser::{ast::Statement, dialect::PostgreSqlDialect, parser::Parser};
 
-use crate::case::{Caller, Case, identifier};
+use crate::{
+    Outcome,
+    case::{Caller, Case, Table, identifier, text_of},
+};
 
 #[derive(QueryableByName)]
 pub(crate) struct JsonRow {
@@ -25,6 +29,28 @@ pub(crate) struct JsonRow {
 pub(crate) struct KeyRow {
     #[diesel(sql_type = Text)]
     pub key: String,
+}
+
+/// One stored row as its key and the version the transaction that last wrote it gave it.
+#[derive(QueryableByName)]
+struct StoredRow {
+    #[diesel(sql_type = Text)]
+    key: String,
+    #[diesel(sql_type = Text)]
+    version: String,
+}
+
+/// The keys whose row version differs between two snapshots, rows added or removed included.
+fn changed(
+    before: &BTreeMap<String, String>,
+    after: &BTreeMap<String, String>,
+) -> BTreeSet<String> {
+    before
+        .keys()
+        .chain(after.keys())
+        .filter(|key| before.get(*key) != after.get(*key))
+        .cloned()
+        .collect()
 }
 
 diesel::table! {
@@ -125,27 +151,88 @@ impl Database {
         )
     }
 
-    /// Read the case projection under the caller's role and settings.
-    pub fn visible(&mut self, case: &Case, caller: &Caller) -> Result<BTreeSet<String>> {
+    /// Run `statement` under the caller's role and settings and collect the keys of the
+    /// `table` rows it returns.
+    pub fn visible(
+        &mut self,
+        table: &Table,
+        caller: &Caller,
+        statement: &str,
+    ) -> Result<BTreeSet<String>> {
         self.connection.batch_execute("BEGIN")?;
         let result = (|| {
-            self.connection
-                .batch_execute(&format!("SET LOCAL ROLE {}", identifier(&caller.role)))?;
-            for (name, value) in &caller.settings {
-                diesel::select(set_config(name, value, true))
-                    .get_result::<String>(&mut self.connection)?;
-            }
-            // The case's projection and row key are runtime fixture data.
+            self.act_as(caller)?;
+            // The case's statement and row key are runtime fixture data.
             let rows = diesel::sql_query(format!(
-                "SELECT CAST({} AS TEXT) AS key FROM ({}) q",
-                identifier(&case.config.key),
-                case.statement()
+                "SELECT {} AS key FROM ({statement}) q",
+                table.key_sql(|key| text_of("q", key)),
             ))
             .load::<KeyRow>(&mut self.connection)?;
             Ok(rows.into_iter().map(|row| row.key).collect())
         })();
         self.connection.batch_execute("ROLLBACK")?;
         result
+    }
+
+    /// Run the write `statement` on `table` under the caller's role and settings, rolled back.
+    pub fn write(&mut self, table: &Table, caller: &Caller, statement: &str) -> Result<Outcome> {
+        self.connection.batch_execute("BEGIN")?;
+        let result = (|| {
+            let before = self.stored(table)?;
+            self.act_as(caller)?;
+            // The case's write is runtime fixture data.
+            if let Err(error) = diesel::sql_query(statement).execute(&mut self.connection) {
+                if let DieselError::DatabaseError(_, information) = &error
+                    && let Some(sqlstate) = information.sqlstate()
+                {
+                    return Ok(Outcome::Rejected(sqlstate.to_string()));
+                }
+                return Err(error.into());
+            }
+            self.connection.batch_execute("RESET ROLE")?;
+            Ok(Outcome::Applied(changed(&before, &self.stored(table)?)))
+        })();
+        self.connection.batch_execute("ROLLBACK")?;
+        result
+    }
+
+    /// The row the table owner's `statement` returns, rolled back.
+    pub fn resulting(&mut self, statement: &str) -> Result<Option<Value>> {
+        self.connection.batch_execute("BEGIN")?;
+        // The case's write is runtime fixture data.
+        let rows = diesel::sql_query(statement).load::<JsonRow>(&mut self.connection);
+        self.connection.batch_execute("ROLLBACK")?;
+        Ok(rows
+            .with_context(|| format!("Running {statement} as the table owner"))?
+            .into_iter()
+            .next()
+            .map(|row| row.row))
+    }
+
+    /// Read the version of every stored row of `table` as the owner, keyed by its row key,
+    /// so a write that leaves a row's values as they were still shows as a change.
+    fn stored(&mut self, table: &Table) -> Result<BTreeMap<String, String>> {
+        // The case supplies the table and row key at runtime.
+        Ok(diesel::sql_query(format!(
+            "SELECT {} AS key, CAST(t.xmin AS TEXT) AS version FROM {} t",
+            table.key_sql(|key| text_of("t", key)),
+            identifier(&table.name)
+        ))
+        .load::<StoredRow>(&mut self.connection)?
+        .into_iter()
+        .map(|row| (row.key, row.version))
+        .collect())
+    }
+
+    /// Take the caller's role and settings for the rest of the open transaction.
+    fn act_as(&mut self, caller: &Caller) -> Result<()> {
+        self.connection
+            .batch_execute(&format!("SET LOCAL ROLE {}", identifier(&caller.role)))?;
+        for (name, value) in &caller.settings {
+            diesel::select(set_config(name, value, true))
+                .get_result::<String>(&mut self.connection)?;
+        }
+        Ok(())
     }
 
     /// Remove only the database and roles created by this case.

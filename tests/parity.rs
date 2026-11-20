@@ -1,7 +1,8 @@
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
 use rls_parity::{
-    Answer, Direction, Engine, Known, Observation, compare, observe_cases, read_known,
+    Answer, Direction, Engine, Known, KnownList, Measurements, compare, generate, observe_cases,
+    read_known,
 };
 
 /// Every recorded discrepancy must be necessary and must remain a discrepancy.
@@ -12,24 +13,56 @@ fn live_known_entry_acceptance() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     omitted_table_seed_is_skipped(root, &database_url, &openfga_url)
         .expect("omitted replica table observations");
-    let observations = observe_cases(&root.join("cases"), &database_url, &openfga_url)
+    let measurements = observe_cases(&root.join("cases"), &database_url, &openfga_url)
         .expect("live three-engine observations");
     let mut known = read_known(&root.join("known.toml")).expect("known discrepancies");
-    assert!(!known.is_empty(), "removal proof needs a known discrepancy");
-    assert_eq!(compare(&observations, &known), Vec::<String>::new());
-    removing_each_entry_reports_exactly_that_divergence(&observations, &mut known);
-    stale_agreement_reports_three_answers(&observations, &mut known);
+    assert!(
+        !known.known.is_empty() && !known.refusal.is_empty(),
+        "removal proof needs a known discrepancy of each kind"
+    );
+    assert_eq!(compare(&measurements, &known), Vec::<String>::new());
+    removing_each_entry_reports_exactly_that_divergence(&measurements, &mut known);
+    stale_agreement_reports_three_answers(&measurements, &mut known);
     fixture_edge_cases(root, &database_url, &openfga_url).expect("edge-case observations");
+    let listed = read_known(&root.join("known.toml")).expect("known discrepancies");
+    generated_failure_replays(root, &database_url, &openfga_url, &listed)
+        .expect("generated observations");
+}
+
+/// The first draw of seed 0 diverges with every construct generated, its written case replays
+/// the divergence, and the listed constructs keep the same draw from diverging.
+fn generated_failure_replays(
+    root: &Path,
+    database_url: &str,
+    openfga_url: &str,
+    known: &KnownList,
+) -> anyhow::Result<()> {
+    let one_draw = Duration::from_millis(1);
+    let directory = tempfile::tempdir_in(root.join("target"))?;
+    let failures = directory.path().join("failures");
+    let unlisted = KnownList::default();
+    let failed = generate(0, one_draw, &unlisted, database_url, openfga_url, &failures)?;
+    assert_eq!(failed, 1);
+    let replayed = observe_cases(&failures, database_url, openfga_url)?;
+    assert_ne!(compare(&replayed, &unlisted), Vec::<String>::new());
+    let listed = directory.path().join("listed");
+    assert_eq!(
+        generate(0, one_draw, known, database_url, openfga_url, &listed)?,
+        0
+    );
+    assert!(!listed.exists());
+    Ok(())
 }
 
 /// Removing a known entry exposes exactly its measured engine disagreement.
 fn removing_each_entry_reports_exactly_that_divergence(
-    observations: &[Observation],
-    known: &mut Vec<Known>,
+    measurements: &Measurements,
+    known: &mut KnownList,
 ) {
-    for index in 0..known.len() {
-        let entry = known.remove(index);
-        let witness = observations
+    for index in 0..known.known.len() {
+        let entry = known.known.remove(index);
+        let witness = measurements
+            .observations
             .iter()
             .find(|observation| {
                 observation.case == entry.case
@@ -39,20 +72,35 @@ fn removing_each_entry_reports_exactly_that_divergence(
             })
             .expect("known entry has a live witness");
         assert_eq!(
-            compare(observations, known),
+            compare(measurements, known),
             [format!(
                 "Unlisted {:?} {:?} {witness:?}",
                 entry.engine, entry.direction
             )],
             "removed {entry:?}"
         );
-        known.insert(index, entry);
+        known.known.insert(index, entry);
+    }
+    for index in 0..known.refusal.len() {
+        let entry = known.refusal.remove(index);
+        let witness = measurements
+            .acceptances
+            .iter()
+            .find(|acceptance| acceptance.case == entry.case)
+            .expect("known refusal has a live witness");
+        assert_eq!(
+            compare(measurements, known),
+            [format!("Unlisted {:?} refusal {witness:?}", entry.engine)],
+            "removed {entry:?}"
+        );
+        known.refusal.insert(index, entry);
     }
 }
 
 /// A stale entry includes the complete agreeing observation in its diagnostic.
-fn stale_agreement_reports_three_answers(observations: &[Observation], known: &mut Vec<Known>) {
-    let witness = observations
+fn stale_agreement_reports_three_answers(measurements: &Measurements, known: &mut KnownList) {
+    let witness = measurements
+        .observations
         .iter()
         .find(|observation| {
             observation.case == "grant_without_update"
@@ -63,7 +111,7 @@ fn stale_agreement_reports_three_answers(observations: &[Observation], known: &m
     assert_eq!(witness.postgres, Answer::Visible);
     assert_eq!(witness.sqlite, Answer::Visible);
     assert_eq!(witness.openfga, Answer::Visible);
-    known.push(Known {
+    known.known.push(Known {
         case: witness.case.clone(),
         caller: witness.caller.clone(),
         row: witness.row.clone(),
@@ -72,7 +120,7 @@ fn stale_agreement_reports_three_answers(observations: &[Observation], known: &m
         direction: Direction::Narrower,
         finding: "deliberately stale acceptance witness".into(),
     });
-    let errors = compare(observations, known);
+    let errors = compare(measurements, known);
     assert_eq!(errors.len(), 1);
     for required in [
         "Stale known entry",
@@ -90,7 +138,7 @@ fn stale_agreement_reports_three_answers(observations: &[Observation], known: &m
             errors[0]
         );
     }
-    known.pop();
+    known.known.pop();
 }
 
 /// Empty suites and unreadable or malformed inputs retain their path in errors.
@@ -156,16 +204,21 @@ fn fixture_edge_cases(root: &Path, database_url: &str, openfga_url: &str) -> any
         ] {
             std::fs::write(case.join(file), content)?;
         }
-        let observations = observe_cases(directory.path(), database_url, openfga_url)?;
-        assert_eq!(observations.len(), 4);
+        let observations = observe_cases(directory.path(), database_url, openfga_url)?.observations;
+        assert_eq!(observations.len(), 8);
         for observation in &observations {
+            let read = observation.statement.starts_with("SELECT");
             if name == "text_key" {
                 assert!(["docs:one", "docs:two"].contains(&observation.row.as_str()));
-                assert_eq!(observation.postgres, observation.sqlite);
-                assert_eq!(observation.postgres, observation.openfga);
-            } else if name == "missing_key" {
+                if read {
+                    assert_eq!(observation.postgres, observation.sqlite);
+                    assert_eq!(observation.postgres, observation.openfga);
+                } else {
+                    assert_eq!(observation.postgres, Answer::Rejected("42501".into()));
+                }
+            } else if read && name == "missing_key" {
                 assert!(matches!(observation.openfga, Answer::Error(_)));
-            } else {
+            } else if read {
                 assert!(matches!(observation.postgres, Answer::Error(_)));
                 assert!(matches!(observation.openfga, Answer::Refused(_)));
             }
@@ -189,9 +242,13 @@ fn omitted_table_seed_is_skipped(
             case.join(filename),
         )?;
     }
-    let observations = observe_cases(directory.path(), database_url, openfga_url)?;
-    assert_eq!(observations.len(), 4);
-    for observation in &observations {
+    let observations = observe_cases(directory.path(), database_url, openfga_url)?.observations;
+    let reads: Vec<_> = observations
+        .iter()
+        .filter(|observation| observation.statement.starts_with("SELECT"))
+        .collect();
+    assert_eq!(reads.len(), 4);
+    for observation in reads {
         assert!(
             matches!(&observation.postgres, Answer::Error(reason) if reason.contains("permission denied")),
             "{observation:?}"

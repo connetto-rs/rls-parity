@@ -1,5 +1,6 @@
-table = "docs"
-key = "id"
+[[tables]]
+name = "docs"
+key = ["id"]
 columns = ["id"]
 
 [[callers]]

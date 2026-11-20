@@ -1,5 +1,6 @@
-table = "jdocs"
-key = "id"
+[[tables]]
+name = "jdocs"
+key = ["id"]
 columns = ["id"]
 
 [[callers]]

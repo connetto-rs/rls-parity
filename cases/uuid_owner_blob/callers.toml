@@ -1,5 +1,6 @@
-table = "udocs"
-key = "id"
+[[tables]]
+name = "udocs"
+key = ["id"]
 columns = ["id"]
 
 [[callers]]

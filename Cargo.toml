@@ -11,9 +11,12 @@ publish = false
 
 [dependencies]
 anyhow = "1"
+# The demo deployment's documents and the options connetto translates it under.
+connetto-demo-deployment = { git = "https://github.com/connetto-rs/connetto-rs", branch = "main" }
+connetto-schema = { git = "https://github.com/connetto-rs/connetto-rs", branch = "main" }
 diesel = { version = "2.3", features = ["postgres", "sqlite", "serde_json"] }
 libsqlite3-sys = { version = "0.38", features = ["bundled"] }
-pg2sqlite = { git = "https://github.com/connetto-rs/pg2sqlite", branch = "main" }
+pg2sqlite = { git = "https://github.com/connetto-rs/pg2sqlite", branch = "main", features = ["diesel"] }
 rls2fga = { git = "https://github.com/connetto-rs/rls2fga", branch = "main", features = ["client"] }
 sql-traits = { git = "https://github.com/connetto-rs/sql-traits", branch = "main" }
 sqlparser = "0.64"
@@ -22,8 +25,7 @@ serde_json = "1"
 toml = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
 thiserror = "2"
-
-[dev-dependencies]
+proptest = "1"
 tempfile = "3"
 
 [build-dependencies]
