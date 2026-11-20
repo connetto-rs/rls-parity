@@ -1,6 +1,6 @@
 [[tables]]
 name = "docs"
-key = "id"
+key = ["id"]
 columns = ["id", "body"]
 
 [[callers]]

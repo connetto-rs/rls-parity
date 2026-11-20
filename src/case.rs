@@ -60,12 +60,12 @@ pub(crate) struct Write {
     pub row: BTreeMap<String, Value>,
 }
 
-/// A measured table, its row key and the columns a read projects.
+/// A measured table, the columns its row key spans and the columns a read projects.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Table {
     pub name: String,
-    pub key: String,
+    pub key: Vec<String>,
     pub columns: Vec<String>,
 }
 
@@ -97,7 +97,7 @@ impl Case {
         ensure!(!config.tables.is_empty(), "No tables in {}", path.display());
         for (index, table) in config.tables.iter().enumerate() {
             ensure!(
-                table.columns.contains(&table.key),
+                !table.key.is_empty() && table.key.iter().all(|key| table.columns.contains(key)),
                 "Projection of {} must include the row key",
                 table.name
             );
@@ -142,7 +142,7 @@ impl Case {
                 if needs_row { "requires" } else { "takes no" }
             );
             ensure!(
-                !needs_row || write.row.contains_key(&table.key),
+                !needs_row || table.key.iter().all(|key| write.row.contains_key(key)),
                 "An inserted row must carry the row key"
             );
         }
@@ -237,17 +237,17 @@ impl Table {
         }
     }
 
-    /// Build `write` as a caller runs it, on the row with `key` or, without one, as declared.
-    pub fn write_statement(&self, write: &Write, key: Option<&Value>) -> String {
-        self.write_sql(write, key, false)
+    /// Build `write` as a caller runs it, on the key of `row` or, without one, as declared.
+    pub fn write_statement(&self, write: &Write, row: Option<&Value>) -> String {
+        self.write_sql(write, row, false)
     }
 
     /// Build `write` returning the row it produces, which the table owner runs to learn it.
-    pub fn resulting_statement(&self, write: &Write, key: Option<&Value>) -> String {
-        self.write_sql(write, key, true)
+    pub fn resulting_statement(&self, write: &Write, row: Option<&Value>) -> String {
+        self.write_sql(write, row, true)
     }
 
-    fn write_sql(&self, write: &Write, key: Option<&Value>, returning: bool) -> String {
+    fn write_sql(&self, write: &Write, row: Option<&Value>, returning: bool) -> String {
         let table = identifier(&self.name);
         let alias = if returning { " AS t" } else { "" };
         let returning = if returning {
@@ -255,8 +255,13 @@ impl Table {
         } else {
             ""
         };
-        let filter = key.map_or_else(String::new, |key| {
-            format!(" WHERE {} = {}", identifier(&self.key), literal(key))
+        let filter = row.map_or_else(String::new, |row| {
+            let matches: Vec<String> = self
+                .key
+                .iter()
+                .map(|key| format!("{} = {}", identifier(key), literal(&row[key.as_str()])))
+                .collect();
+            format!(" WHERE {}", matches.join(" AND "))
         });
         match write.shape {
             Shape::Insert => format!(
@@ -291,14 +296,39 @@ impl Table {
     pub fn read_columns(&self) -> BTreeMap<ColumnCommand, Vec<String>> {
         BTreeMap::from([(ColumnCommand::Select, self.columns.clone())])
     }
+
+    /// The text a row's key compares as, each key column as `CAST(column AS TEXT)` prints
+    /// it, joined by commas, `column` looking up the row's value of a column.
+    pub fn row_key<'row>(&self, column: impl Fn(&str) -> Option<&'row Value>) -> Result<String> {
+        let parts = self
+            .key
+            .iter()
+            .map(|key| {
+                column(key)
+                    .map(key_text)
+                    .with_context(|| format!("A row of {} has no key column {key}", self.name))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(parts.join(","))
+    }
+
+    /// The SQL expression spelling a row's key as [`Self::row_key`] does, its columns read
+    /// through `qualifier`.
+    pub fn key_sql(&self, qualifier: &str) -> String {
+        self.key
+            .iter()
+            .map(|key| format!("CAST({qualifier}.{} AS TEXT)", identifier(key)))
+            .collect::<Vec<_>>()
+            .join(" || ',' || ")
+    }
 }
 
 impl Write {
     /// The columns this write touches under each column command, `key` being the row key
-    /// a keyed `WHERE` reads.
-    pub fn columns(&self, key: &str) -> BTreeMap<ColumnCommand, Vec<String>> {
+    /// columns a keyed `WHERE` reads.
+    pub fn columns(&self, key: &[String]) -> BTreeMap<ColumnCommand, Vec<String>> {
         let read = match self.shape {
-            Shape::Update | Shape::Delete => vec![key.to_owned()],
+            Shape::Update | Shape::Delete => key.to_vec(),
             _ => Vec::new(),
         };
         let (command, assigned) = match self.shape {
@@ -312,8 +342,8 @@ impl Write {
     }
 }
 
-/// The text a row key compares as, the way `CAST(key AS TEXT)` prints it.
-pub(crate) fn key_text(value: &Value) -> String {
+/// The text a row key column compares as, the way `CAST(column AS TEXT)` prints it.
+fn key_text(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
         other => other.to_string(),
@@ -364,7 +394,9 @@ mod tests {
                 "Projection of docs must include",
             ),
             (
-                format!("{valid}\n[[tables]]\nname = \"docs\"\nkey = \"id\"\ncolumns = [\"id\"]\n"),
+                format!(
+                    "{valid}\n[[tables]]\nname = \"docs\"\nkey = [\"id\"]\ncolumns = [\"id\"]\n"
+                ),
                 "declared twice",
             ),
             (
@@ -447,9 +479,40 @@ mod tests {
         }))?;
         assert_eq!(
             case.table("docs")?
-                .write_statement(&write, Some(&"o'k".into())),
+                .write_statement(&write, Some(&serde_json::json!({ "id": "o'k", "body": 1 }))),
             "UPDATE \"docs\" SET \"a\" = NULL, \"b\" = true, \"c\" = 'it''s', \"d\" = '[\"x''y\"]' \
              WHERE \"id\" = 'o''k'"
+        );
+        Ok(())
+    }
+
+    /// A composite key filters a write on every key column, names a row by all of them, and
+    /// refuses a row missing one.
+    #[test]
+    fn composite_key() -> Result<()> {
+        let case = Case::read(&Path::new(env!("CARGO_MANIFEST_DIR")).join("cases/composite_key"))?;
+        let table = case.table("lines")?;
+        let delete: Write = serde_json::from_value(serde_json::json!({
+            "table": "lines",
+            "shape": "delete",
+        }))?;
+        let row = serde_json::json!({ "order_id": 1, "line_no": "2", "owner": "bob" });
+        assert_eq!(
+            table.write_statement(&delete, Some(&row)),
+            "DELETE FROM \"lines\" WHERE \"order_id\" = 1 AND \"line_no\" = '2'"
+        );
+        assert_eq!(table.row_key(|column| row.get(column))?, "1,2");
+        assert_eq!(
+            table.key_sql("q"),
+            "CAST(q.\"order_id\" AS TEXT) || ',' || CAST(q.\"line_no\" AS TEXT)"
+        );
+        let error = table
+            .row_key(|column| row.get(column).filter(|_| column == "order_id"))
+            .err()
+            .context("A row without line_no has no key")?;
+        assert!(
+            error.to_string().contains("no key column line_no"),
+            "{error}"
         );
         Ok(())
     }

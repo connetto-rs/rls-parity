@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::{
     Acceptance, Answer, KnownList, Measurements, Observation, Outcome, Prepared,
-    case::{Caller, Case, Shape, Table, Write, identifier, key_text},
+    case::{Caller, Case, Shape, Table, Write, identifier},
     openfga::{Model, Probe},
     postgres::Database,
     sqlite::Replica,
@@ -172,7 +172,7 @@ fn measure_reads(
                 replica.visible(table, caller_index, &statement)
             });
             for row in rows {
-                let key = key_text(row.get(&table.key).context("Seeded row has no key")?);
+                let key = table.row_key(|column| row.get(column))?;
                 let sqlite_answer = match &sqlite {
                     Err(reason) => Answer::Refused(reason.clone()),
                     Ok(answer) => visibility(answer, &key),
@@ -326,17 +326,14 @@ fn targets<'a>(
     rows: &'a [Value],
     database: &mut Database,
 ) -> Result<Vec<Target<'a>>> {
-    let key_of = |row: &'a Value| row.get(&table.key).context("Seeded row has no key");
+    let key_of = |row: &Value| table.row_key(|column| row.get(column));
     match write.shape {
         Shape::Insert => {
-            let key = write
-                .row
-                .get(&table.key)
-                .context("Inserted row has no key")?;
+            let key = table.row_key(|column| write.row.get(column))?;
             Ok(vec![Target {
                 statement: table.write_statement(write, None),
                 rows: vec![TargetRow {
-                    key: key_text(key),
+                    key,
                     existing: None,
                     resulting: database.resulting(&table.resulting_statement(write, None))?,
                 }],
@@ -345,11 +342,10 @@ fn targets<'a>(
         Shape::UpdateWithoutWhere => {
             let mut target_rows = Vec::new();
             for row in rows {
-                let key = key_of(row)?;
                 target_rows.push(TargetRow {
-                    key: key_text(key),
+                    key: key_of(row)?,
                     existing: Some(row),
-                    resulting: database.resulting(&table.resulting_statement(write, Some(key)))?,
+                    resulting: database.resulting(&table.resulting_statement(write, Some(row)))?,
                 });
             }
             Ok(vec![Target {
@@ -364,12 +360,12 @@ fn targets<'a>(
                 let resulting = if write.shape == Shape::Delete {
                     None
                 } else {
-                    database.resulting(&table.resulting_statement(write, Some(key)))?
+                    database.resulting(&table.resulting_statement(write, Some(row)))?
                 };
                 Ok(Target {
-                    statement: table.write_statement(write, Some(key)),
+                    statement: table.write_statement(write, Some(row)),
                     rows: vec![TargetRow {
-                        key: key_text(key),
+                        key,
                         existing: Some(row),
                         resulting,
                     }],

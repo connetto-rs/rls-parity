@@ -1,6 +1,6 @@
 [[tables]]
 name = "udocs"
-key = "id"
+key = ["id"]
 columns = ["id"]
 
 [[callers]]

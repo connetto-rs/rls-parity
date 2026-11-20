@@ -166,8 +166,8 @@ impl Replica {
             .with_context(|| format!("{statement} did not translate to one query"))?;
         // The case supplies the statement and row key at runtime.
         let rows = diesel::sql_query(format!(
-            "SELECT CAST({} AS TEXT) AS key FROM ({query}) q",
-            identifier(&table.key),
+            "SELECT {} AS key FROM ({query}) q",
+            table.key_sql("q"),
         ))
         .load::<KeyRow>(&mut self.connection)?;
         Ok(Prepared::Ready(
@@ -248,8 +248,8 @@ fn track_changes(
         };
         let logical = format!("'{}'", table.name.replace('\'', "''"));
         let physical = identifier(&entry.physical);
-        let old = format!("({logical}, CAST(OLD.{} AS TEXT))", identifier(&table.key));
-        let new = format!("({logical}, CAST(NEW.{} AS TEXT))", identifier(&table.key));
+        let old = format!("({logical}, {})", table.key_sql("OLD"));
+        let new = format!("({logical}, {})", table.key_sql("NEW"));
         for (event, rows) in [
             ("INSERT", new.clone()),
             ("UPDATE", format!("{old}, {new}")),

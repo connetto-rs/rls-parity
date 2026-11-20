@@ -164,8 +164,8 @@ impl Database {
             self.act_as(caller)?;
             // The case's statement and row key are runtime fixture data.
             let rows = diesel::sql_query(format!(
-                "SELECT CAST({} AS TEXT) AS key FROM ({statement}) q",
-                identifier(&table.key),
+                "SELECT {} AS key FROM ({statement}) q",
+                table.key_sql("q"),
             ))
             .load::<KeyRow>(&mut self.connection)?;
             Ok(rows.into_iter().map(|row| row.key).collect())
@@ -214,8 +214,8 @@ impl Database {
     fn stored(&mut self, table: &Table) -> Result<BTreeMap<String, String>> {
         // The case supplies the table and row key at runtime.
         Ok(diesel::sql_query(format!(
-            "SELECT CAST(t.{} AS TEXT) AS key, CAST(t.xmin AS TEXT) AS version FROM {} t",
-            identifier(&table.key),
+            "SELECT {} AS key, CAST(t.xmin AS TEXT) AS version FROM {} t",
+            table.key_sql("t"),
             identifier(&table.name)
         ))
         .load::<StoredRow>(&mut self.connection)?

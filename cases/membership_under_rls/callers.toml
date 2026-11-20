@@ -1,11 +1,11 @@
 [[tables]]
 name = "tdocs"
-key = "id"
+key = ["id"]
 columns = ["id"]
 
 [[tables]]
 name = "members"
-key = "user_id"
+key = ["user_id"]
 columns = ["team", "user_id"]
 
 [[callers]]

@@ -1,6 +1,6 @@
 [[tables]]
 name = "p"
-key = "id"
+key = ["id"]
 columns = ["id"]
 
 [[callers]]

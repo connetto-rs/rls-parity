@@ -414,7 +414,7 @@ impl Draft {
                 rows.join(", ")
             ));
             callers.push(format!(
-                "[[tables]]\nname = \"{name}\"\nkey = \"id\"\ncolumns = [{}]\n",
+                "[[tables]]\nname = \"{name}\"\nkey = [\"id\"]\ncolumns = [{}]\n",
                 columns
                     .iter()
                     .map(|column| format!("\"{column}\""))
