@@ -96,7 +96,7 @@ pub(crate) struct Replica {
 impl Replica {
     /// Load the script emitted for `role` and seed its published physical tables.
     pub fn create(case: &Case, role: &str) -> Result<Prepared<Self>> {
-        let jsonb = JsonbFunctions::new("jsonb_canonical", "jsonb_order");
+        let jsonb = JsonbFunctions::new("jsonb_canonical", "jsonb_text", "jsonb_order");
         let options = match case.config.source {
             Source::Files => files_options(case, role, jsonb.clone())?,
             Source::Connetto => connetto::replica_options(role)?,
