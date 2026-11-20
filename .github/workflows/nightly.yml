@@ -1,0 +1,65 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 4
+  RUSTC_WRAPPER: ""
+  RUSTC_WORKSPACE_WRAPPER: ""
+
+jobs:
+  generate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+      OPENFGA_URL: http://127.0.0.1:8080
+      OPENFGA_CONTAINER: rlspar-nightly-fga-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Start OpenFGA
+        run: |
+          docker run -d --name "$OPENFGA_CONTAINER" -p 127.0.0.1:8080:8080 openfga/openfga:v1.11.6 run
+          timeout 60 bash -c 'until curl --fail --silent "$OPENFGA_URL/healthz"; do sleep 1; done'
+      - run: cargo update
+      - run: nice -n 10 cargo build --release
+      - name: Seed from the date
+        run: echo "SEED=$(date -u +%Y%m%d)" >> "$GITHUB_ENV"
+      - run: nice -n 10 cargo run --release -- generate --seed "$SEED" --minutes 30
+      - name: Upload failures
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failures-${{ env.SEED }}
+          path: failures/
+          if-no-files-found: ignore
+      - name: OpenFGA failure logs
+        if: failure()
+        run: docker logs "$OPENFGA_CONTAINER"
+      - name: Remove OpenFGA
+        if: always()
+        run: docker rm -f "$OPENFGA_CONTAINER"
