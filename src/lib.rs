@@ -5,11 +5,13 @@ mod connetto;
 mod generator;
 mod openfga;
 mod postgres;
+mod record;
 mod rows;
 mod runner;
 mod sqlite;
 
 pub use generator::{Construct, generate};
+pub use record::{CaseKnown, EngineKnown, KnownRow, Recorded, RecordedAnswer, fixture, record};
 pub use runner::{RunError, observe_cases, read_known};
 
 use std::collections::BTreeSet;
@@ -96,7 +98,7 @@ pub enum Engine {
 }
 
 /// The way an answer differs from PostgreSQL.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Direction {
     Wider,

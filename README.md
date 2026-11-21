@@ -38,6 +38,10 @@ cargo llvm-cov report --include-build-script --lcov --output-path lcov.info
 
 `Cargo.lock` remains local. The runner creates and removes each case database and its roles. Pass `-- --known PATH` to test an alternate known list.
 
+## Record
+
+`cargo run --release -- record --out PATH` runs the comparison and, when it passes, copies every case not built from connetto into `PATH`. Each copy adds `postgres.toml`, an `[[answer]]` per caller, row and statement with PostgreSQL's answer. A case with known discrepancies also gets a `known.toml` with a `[sqlite]` and an `[openfga]` table, each holding the engine's `refusal` finding and its `[[sqlite.row]]` or `[[openfga.row]]` entries with `caller`, `row`, `statement`, `direction` and `finding`. Either engine's crate can then replay a case against `postgres.toml` without running PostgreSQL as the oracle.
+
 ## Generate
 
 `cargo run --release -- generate --seed N --minutes M` draws random cases for `M` minutes. A case has one to three tables with integer, text, `uuid`, `jsonb`, boolean and `timestamptz` columns, grants, role membership, and permissive or restrictive policies for every command over the caller, its subjects, team memberships, flags and constants. Each draw follows from the seed and its index alone. A case with any discrepancy is shrunk and written to `failures/seed{N}-{draw}/`, a case directory that replays once copied into `cases/`.

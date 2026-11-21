@@ -1,9 +1,10 @@
 use std::{env, io::Write, path::Path, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
-use rls_parity::{KnownList, Measurements, compare, generate, observe_cases, read_known};
+use rls_parity::{KnownList, Measurements, compare, generate, observe_cases, read_known, record};
 
-/// Compare every case against a live PostgreSQL oracle, or generate cases for a while.
+/// Compare every case against a live PostgreSQL oracle, record the cases as fixtures, or
+/// generate cases for a while.
 fn main() -> Result<()> {
     println!("{}", env!("DEPENDENCY_REVISIONS"));
     let args: Vec<String> = env::args().skip(1).collect();
@@ -33,6 +34,19 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
+        Command::Record(out) => {
+            let cases = Path::new("cases");
+            let measurements = observe_cases(cases, &database_url, &openfga_url)?;
+            report(
+                &measurements,
+                &known,
+                std::io::stdout().lock(),
+                std::io::stderr().lock(),
+            )?;
+            let written = record(cases, &measurements, &known, out)?;
+            println!("Recorded {written} cases under {}", out.display());
+            Ok(())
+        }
     }
 }
 
@@ -42,6 +56,9 @@ enum Command<'a> {
     Compare(&'a Path),
     /// Generate cases from `seed` for `minutes`.
     Generate { seed: u64, minutes: u64 },
+    /// Record every files case with PostgreSQL's answers and its known entries under this
+    /// directory.
+    Record(&'a Path),
 }
 
 impl Command<'_> {
@@ -49,7 +66,7 @@ impl Command<'_> {
     fn known(&self) -> &Path {
         match self {
             Self::Compare(path) => path,
-            Self::Generate { .. } => Path::new("known.toml"),
+            Self::Generate { .. } | Self::Record(_) => Path::new("known.toml"),
         }
     }
 }
@@ -69,7 +86,12 @@ fn command(args: &[String]) -> Result<Command<'_>> {
                     .context("--minutes takes an unsigned integer")?,
             })
         }
-        _ => bail!("Usage cargo run -- [--known PATH] | generate --seed N --minutes M"),
+        [record, out_flag, out] if record == "record" && out_flag == "--out" => {
+            Ok(Command::Record(Path::new(out)))
+        }
+        _ => bail!(
+            "Usage cargo run -- [--known PATH] | generate --seed N --minutes M | record --out PATH"
+        ),
     }
 }
 
@@ -127,11 +149,14 @@ mod tests {
                 minutes: 30
             }
         );
+        let record = args(&["record", "--out", "fixtures"]);
+        assert_eq!(command(&record)?, Command::Record(Path::new("fixtures")));
         for words in [
             &["--known"][..],
             &["--unknown", "other.toml"],
             &["generate", "--seed", "-1", "--minutes", "30"],
             &["generate", "--minutes", "30", "--seed", "7"],
+            &["record", "fixtures"],
         ] {
             assert!(command(&args(words)).is_err());
         }
