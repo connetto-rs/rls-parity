@@ -11,7 +11,7 @@ mod runner;
 
 pub use generator::{Construct, generate};
 pub use record::{record, recorded, verify_recorded};
-pub use runner::{RunError, observe_cases, observe_suite, read_known};
+pub use runner::{RunError, observe_cases, observe_fixture, observe_suite, read_known};
 pub use sql_traits::parity::{Answer, Engine};
 
 use std::collections::BTreeSet;
@@ -70,6 +70,15 @@ pub struct Measurements {
     pub acceptances: Vec<Acceptance>,
     pub observations: Vec<Observation>,
     pub errors: Vec<String>,
+}
+
+impl Measurements {
+    /// Append another run's measurements and failures.
+    pub fn extend(&mut self, other: Self) {
+        self.acceptances.extend(other.acceptances);
+        self.observations.extend(other.observations);
+        self.errors.extend(other.errors);
+    }
 }
 
 /// A generator construct whose divergence is tracked, so the generator never produces it.

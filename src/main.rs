@@ -1,7 +1,7 @@
 use std::{env, io::Write, path::Path, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
-use rls_parity::{Measurements, generate, observe_cases, observe_suite, read_known, record};
+use rls_parity::{Measurements, generate, observe_suite, read_known, record};
 
 /// Compare every case against a live PostgreSQL oracle, record the cases as fixtures, or
 /// generate cases for a while.
@@ -15,13 +15,7 @@ fn main() -> Result<()> {
     let openfga_url = env::var("OPENFGA_URL").context("Set OPENFGA_URL to OpenFGA v1.11.6")?;
     match command {
         Command::Compare => {
-            let mut measurements = observe_suite(Path::new("cases"), &database_url, &openfga_url)?;
-            if Path::new("failures").exists() {
-                let failures = observe_cases(Path::new("failures"), &database_url, &openfga_url)?;
-                measurements.acceptances.extend(failures.acceptances);
-                measurements.observations.extend(failures.observations);
-                measurements.errors.extend(failures.errors);
-            }
+            let measurements = observe_suite(Path::new("."), &database_url, &openfga_url)?;
             report(
                 &measurements,
                 std::io::stdout().lock(),
@@ -40,7 +34,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Record(out) => {
-            let measurements = observe_suite(Path::new("cases"), &database_url, &openfga_url)?;
+            let measurements = observe_suite(Path::new("."), &database_url, &openfga_url)?;
             let written = record(&measurements, out)?;
             println!("Recorded {written} cases under {}", out.display());
             Ok(())

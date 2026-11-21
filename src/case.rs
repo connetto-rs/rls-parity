@@ -12,10 +12,12 @@ pub(crate) fn read(path: &Path) -> Result<Case> {
         .context("Case directory has no name")?
         .to_str()
         .context("Case name is not UTF-8")?;
-    let callers = fs::read_to_string(path.join("callers.toml"))
-        .with_context(|| format!("Reading callers of {name}"))?;
-    let seed = fs::read_to_string(path.join("seed.sql"))
-        .with_context(|| format!("Reading seed of {name}"))?;
+    let read_file = |file| {
+        fs::read_to_string(path.join(file))
+            .with_context(|| format!("Reading {file} in {}", path.display()))
+    };
+    let callers = read_file("callers.toml")?;
+    let seed = read_file("seed.sql")?;
     if name == "connetto_deployment" {
         let config: Config = toml::from_str(&callers)?;
         Ok(Case {
@@ -25,8 +27,7 @@ pub(crate) fn read(path: &Path) -> Result<Case> {
             config,
         })
     } else {
-        let schema = fs::read_to_string(path.join("schema.sql"))
-            .with_context(|| format!("Reading schema of {name}"))?;
+        let schema = read_file("schema.sql")?;
         Case::parse(name, schema, seed, callers).map_err(Into::into)
     }
 }
