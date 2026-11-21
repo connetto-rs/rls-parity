@@ -58,6 +58,36 @@ case = "partitioned"
 engine = "sqlite"
 finding = "8, SQLite translation refuses partitioned tables, which rls2fga accepts"
 
+[[refusal]]
+case = "self_referential"
+engine = "sqlite"
+finding = "8, SQLite refuses a recursive policy that PostgreSQL rejects during the read"
+
+[[refusal]]
+case = "self_referential"
+engine = "openfga"
+finding = "8, rls2fga refuses a recursive policy that PostgreSQL rejects during the read"
+
+[[refusal]]
+case = "separator_mismatch"
+engine = "sqlite"
+finding = "3, the declared set separator differs from the policy separator"
+
+[[refusal]]
+case = "separator_mismatch"
+engine = "openfga"
+finding = "3, the declared set separator differs from the policy separator"
+
+[[refusal]]
+case = "uuid_owner_blob"
+engine = "sqlite"
+finding = "4, the declared text caller setting is cast to `UUID` by the policy"
+
+[[refusal]]
+case = "uuid_owner_blob"
+engine = "openfga"
+finding = "4, the `UUID` caller cast falls below the translation confidence threshold"
+
 [[known]]
 case = "partitioned"
 caller = "alice"
