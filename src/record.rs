@@ -1,158 +1,83 @@
-//! Each files case written as a fixture that one engine replays against PostgreSQL's
-//! recorded answers.
+//! Live PostgreSQL answers and exported fixtures.
 
 use std::{fs, path::Path};
 
-use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use anyhow::{Context, Result, bail};
+use sql_traits::parity::{Recorded, RecordedAnswer, fixtures};
 
-use crate::{
-    Answer, Direction, Engine, KnownList, Measurements,
-    case::{Case, Source},
-};
+use crate::{Measurements, Observation};
 
-/// PostgreSQL's answer for every caller, row and statement of one case.
-#[derive(Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Recorded {
-    #[serde(default)]
-    pub answer: Vec<RecordedAnswer>,
-}
-
-/// PostgreSQL's answer for one caller, row and statement.
-#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct RecordedAnswer {
-    pub caller: String,
-    pub row: String,
-    pub statement: String,
-    pub postgres: Answer,
-}
-
-/// One case's known discrepancies, per engine.
-#[derive(Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CaseKnown {
-    #[serde(default, skip_serializing_if = "EngineKnown::is_empty")]
-    pub sqlite: EngineKnown,
-    #[serde(default, skip_serializing_if = "EngineKnown::is_empty")]
-    pub openfga: EngineKnown,
-}
-
-impl CaseKnown {
-    /// Whether neither engine has a known discrepancy.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.sqlite.is_empty() && self.openfga.is_empty()
-    }
-
-    /// The known discrepancies of `engine`.
-    fn engine(&mut self, engine: Engine) -> &mut EngineKnown {
-        match engine {
-            Engine::Sqlite => &mut self.sqlite,
-            Engine::Openfga => &mut self.openfga,
-        }
-    }
-}
-
-/// One engine's known discrepancies in one case.
-#[derive(Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct EngineKnown {
-    /// The finding behind this engine's translator refusing a schema the other accepts.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub refusal: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub row: Vec<KnownRow>,
-}
-
-impl EngineKnown {
-    /// Whether the engine has no known discrepancy.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.refusal.is_none() && self.row.is_empty()
-    }
-}
-
-/// A row on which one engine is known to answer differently from PostgreSQL.
-#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct KnownRow {
-    pub caller: String,
-    pub row: String,
-    pub statement: String,
-    pub direction: Direction,
-    pub finding: String,
-}
-
-/// The fixture for case `name`, PostgreSQL's answers from `measurements` and the entries
-/// of `known` naming the case.
+/// Collect PostgreSQL's answers from live observations.
 #[must_use]
-pub fn fixture(
-    name: &str,
-    measurements: &Measurements,
-    known: &KnownList,
-) -> (Recorded, CaseKnown) {
-    let answer = measurements
-        .observations
-        .iter()
-        .filter(|observation| observation.case == name)
-        .map(|observation| RecordedAnswer {
-            caller: observation.caller.clone(),
-            row: observation.row.clone(),
-            statement: observation.statement.clone(),
-            postgres: observation.postgres.clone(),
-        })
-        .collect();
-    let mut case_known = CaseKnown::default();
-    for entry in known.known.iter().filter(|entry| entry.case == name) {
-        case_known.engine(entry.engine).row.push(KnownRow {
-            caller: entry.caller.clone(),
-            row: entry.row.clone(),
-            statement: entry.statement.clone(),
-            direction: entry.direction,
-            finding: entry.finding.clone(),
-        });
+pub fn recorded<'observation>(
+    observations: impl IntoIterator<Item = &'observation Observation>,
+) -> Recorded {
+    Recorded {
+        answer: observations
+            .into_iter()
+            .map(|observation| RecordedAnswer {
+                caller: observation.caller.clone(),
+                row: observation.row.clone(),
+                statement: observation.statement.clone(),
+                postgres: observation.postgres.clone(),
+            })
+            .collect(),
     }
-    for entry in known.refusal.iter().filter(|entry| entry.case == name) {
-        case_known.engine(entry.engine).refusal = Some(entry.finding.clone());
-    }
-    (Recorded { answer }, case_known)
 }
 
-/// Write every files case under `cases` into `out`, beside its recorded answers in
-/// `postgres.toml` and its known discrepancies in `known.toml`, and answer how many were
-/// written. A case built from connetto stays out.
+/// Check the recorded oracle against live PostgreSQL.
 ///
 /// # Errors
-/// Returns the case and cause when a case cannot be read or its fixture written.
-pub fn record(
-    cases: &Path,
-    measurements: &Measurements,
-    known: &KnownList,
-    out: &Path,
-) -> Result<usize> {
-    let mut directories = fs::read_dir(cases)?
-        .map(|entry| entry.map(|entry| entry.path()))
-        .collect::<std::io::Result<Vec<_>>>()?;
-    directories.sort();
+/// Returns the case and first differing answer.
+pub fn verify_recorded(name: &str, expected: &Recorded, live: &Recorded) -> Result<()> {
+    let count = expected.answer.len().max(live.answer.len());
+    let expected = expected
+        .answer
+        .iter()
+        .map(Some)
+        .chain(std::iter::repeat(None));
+    let actual = live.answer.iter().map(Some).chain(std::iter::repeat(None));
+    for (index, (expected, actual)) in expected.zip(actual).take(count).enumerate() {
+        if expected != actual {
+            bail!("{name} recorded answer {index} differs, recorded={expected:?}, live={actual:?}");
+        }
+    }
+    Ok(())
+}
+
+/// Write embedded cases with their live PostgreSQL answers.
+///
+/// # Errors
+/// Returns the case and cause when an answer is missing or a file cannot be written.
+pub fn record(measurements: &Measurements, out: &Path) -> Result<usize> {
     let mut written = 0;
-    for directory in directories {
-        let case =
-            Case::read(&directory).with_context(|| format!("Reading {}", directory.display()))?;
-        if case.config.source != Source::Files {
-            continue;
-        }
+    for fixture in fixtures() {
+        let fixture = fixture?;
+        let case = fixture.case;
+        let observations = recorded(
+            measurements
+                .observations
+                .iter()
+                .filter(|observation| observation.case == case.name),
+        );
+        anyhow::ensure!(
+            !observations.answer.is_empty(),
+            "No live answers for {}",
+            case.name
+        );
         let target = out.join(&case.name);
-        fs::create_dir_all(&target)?;
-        for file in ["schema.sql", "seed.sql", "callers.toml"] {
-            fs::copy(directory.join(file), target.join(file))
-                .with_context(|| format!("Copying {file} of {}", case.name))?;
+        fs::create_dir_all(&target).with_context(|| format!("Creating {}", target.display()))?;
+        for (file, contents) in [
+            ("schema.sql", case.schema),
+            ("seed.sql", case.seed),
+            ("callers.toml", toml::to_string(&case.config)?),
+            ("postgres.toml", toml::to_string(&observations)?),
+        ] {
+            fs::write(target.join(file), contents)
+                .with_context(|| format!("Writing {file} of {}", case.name))?;
         }
-        let (recorded, case_known) = fixture(&case.name, measurements, known);
-        fs::write(target.join("postgres.toml"), toml::to_string(&recorded)?)?;
-        if !case_known.is_empty() {
-            fs::write(target.join("known.toml"), toml::to_string(&case_known)?)?;
+        if !fixture.known.is_empty() {
+            fs::write(target.join("known.toml"), toml::to_string(&fixture.known)?)?;
         }
         written += 1;
     }
@@ -162,101 +87,27 @@ pub fn record(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Known, KnownRefusal, Observation};
+    use crate::Answer;
 
-    fn observation(case: &str, caller: &str, postgres: Answer) -> Observation {
-        Observation {
-            case: case.into(),
-            caller: caller.into(),
-            row: "docs:1".into(),
-            statement: "SELECT \"id\" FROM \"docs\"".into(),
-            postgres,
-            sqlite: Answer::Hidden,
-            openfga: Answer::Visible,
-        }
-    }
-
-    fn known_row(case: &str, engine: Engine, finding: &str) -> Known {
-        Known {
-            case: case.into(),
-            caller: "alice".into(),
-            row: "docs:1".into(),
-            statement: "SELECT \"id\" FROM \"docs\"".into(),
-            engine,
-            direction: Direction::Narrower,
-            finding: finding.into(),
-        }
-    }
-
-    /// A case's fixture holds PostgreSQL's answers for that case alone, and its known
-    /// entries split by the engine they name, and both survive a TOML round trip.
+    /// Changed, missing and extra recorded answers identify the first mismatch.
     #[test]
-    fn fixture_keeps_one_case_split_by_engine() -> Result<()> {
-        let measurements = Measurements {
-            acceptances: Vec::new(),
-            observations: vec![
-                observation("docs", "alice", Answer::Visible),
-                observation("other", "alice", Answer::Hidden),
-                observation("docs", "bob", Answer::Rejected("42501".into())),
-            ],
-        };
-        let known = KnownList {
-            known: vec![
-                known_row("docs", Engine::Sqlite, "sqlite finding"),
-                known_row("other", Engine::Openfga, "other finding"),
-                known_row("docs", Engine::Openfga, "openfga finding"),
-            ],
-            refusal: vec![KnownRefusal {
-                case: "docs".into(),
-                engine: Engine::Openfga,
-                finding: "refusal finding".into(),
-            }],
-            construct: Vec::new(),
-        };
-        let (recorded, case_known) = fixture("docs", &measurements, &known);
-        let row = |finding: &str| KnownRow {
-            caller: "alice".into(),
-            row: "docs:1".into(),
-            statement: "SELECT \"id\" FROM \"docs\"".into(),
-            direction: Direction::Narrower,
-            finding: finding.into(),
-        };
-        let answer = |caller: &str, postgres| RecordedAnswer {
-            caller: caller.into(),
-            row: "docs:1".into(),
-            statement: "SELECT \"id\" FROM \"docs\"".into(),
-            postgres,
-        };
-        assert_eq!(
-            recorded,
-            Recorded {
-                answer: vec![
-                    answer("alice", Answer::Visible),
-                    answer("bob", Answer::Rejected("42501".into())),
-                ],
-            }
-        );
-        assert_eq!(
-            case_known,
-            CaseKnown {
-                sqlite: EngineKnown {
-                    refusal: None,
-                    row: vec![row("sqlite finding")],
-                },
-                openfga: EngineKnown {
-                    refusal: Some("refusal finding".into()),
-                    row: vec![row("openfga finding")],
-                },
-            }
-        );
-        assert_eq!(
-            toml::from_str::<Recorded>(&toml::to_string(&recorded)?)?,
-            recorded
-        );
-        assert_eq!(
-            toml::from_str::<CaseKnown>(&toml::to_string(&case_known)?)?,
-            case_known
-        );
+    fn recorded_answer_mutation_is_rejected() -> Result<()> {
+        let fixture = fixtures().next().context("No embedded fixture")??;
+        let live = &fixture.recorded;
+        verify_recorded(&fixture.case.name, live, live)?;
+        let mut mutated = live.clone();
+        mutated.answer[0].postgres = Answer::Error("mutated oracle".into());
+        let error = verify_recorded(&fixture.case.name, &mutated, live)
+            .expect_err("changed recorded answer must fail");
+        let message = error.to_string();
+        assert!(message.contains(&fixture.case.name));
+        assert!(message.contains(&live.answer[0].caller));
+        assert!(message.contains(&live.answer[0].row));
+        assert!(message.contains("mutated oracle"));
+        mutated = live.clone();
+        mutated.answer.pop();
+        assert!(verify_recorded(&fixture.case.name, &mutated, live).is_err());
+        assert!(verify_recorded(&fixture.case.name, live, &mutated).is_err());
         Ok(())
     }
 }

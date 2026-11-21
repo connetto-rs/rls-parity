@@ -17,7 +17,7 @@ use proptest::{
 };
 use serde::Deserialize;
 
-use crate::{KnownList, compare, observe_cases};
+use crate::{KnownList, observe_cases};
 
 /// A generated combination whose divergence `known.toml` tracks, one per known finding.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
@@ -682,7 +682,7 @@ fn check(
         .map_err(fail)?;
     let measurements = observe_cases(directory.path(), database_url, openfga_url)
         .map_err(|error| fail(error.into()))?;
-    let errors = compare(&measurements, &KnownList::default());
+    let errors = measurements.errors;
     if errors.is_empty() {
         Ok(())
     } else {
@@ -752,7 +752,7 @@ pub fn generate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::case::Case;
+    use crate::case;
 
     const EVERY: [Construct; 10] = [
         Construct::UuidSettingCast,
@@ -778,7 +778,7 @@ mod tests {
             for disabled in [BTreeSet::new(), BTreeSet::from(EVERY)] {
                 let path = directory.path().join("generated");
                 draft.write(&path, &disabled).map_err(|error| TestCaseError::fail(error.to_string()))?;
-                let case = Case::read(&path).map_err(|error| TestCaseError::fail(error.to_string()))?;
+                let case = case::read(&path).map_err(|error| TestCaseError::fail(error.to_string()))?;
                 if disabled.is_empty() {
                     continue;
                 }
@@ -797,7 +797,7 @@ mod tests {
                     }
                     prop_assert!(inserts.iter().all(|held| *held == inserts[0]), "{}", case.schema);
                 }
-                prop_assert!(case.config.writes.iter().all(|write| !matches!(write.shape, crate::case::Shape::SelectForUpdate | crate::case::Shape::UpdateWithoutWhere)));
+                prop_assert!(case.config.writes.iter().all(|write| !matches!(write.shape, sql_traits::parity::Shape::SelectForUpdate | sql_traits::parity::Shape::UpdateWithoutWhere)));
             }
         }
     }

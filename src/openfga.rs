@@ -17,14 +17,43 @@ use rls2fga::{
     },
 };
 use serde_json::{Map, Value, json};
+use sql_traits::parity::{Caller, Case, Shape, Table};
 use sql_traits::prelude::{SetPacking, SettingContent, SettingValue};
 
 use crate::{
     Prepared,
-    case::{Caller, Case, Table},
     postgres::{Database, JsonRow},
     rows::Row,
 };
+
+/// Convert a neutral probe shape to the `OpenFGA` action.
+pub(crate) fn action(shape: Shape) -> ActionStatement {
+    match shape {
+        Shape::Select => ActionStatement::Select,
+        Shape::SelectForUpdate => ActionStatement::SelectForUpdate,
+        Shape::Update => ActionStatement::Update,
+        Shape::UpdateWithoutWhere => ActionStatement::UpdateWithoutWhere,
+        Shape::Delete => ActionStatement::Delete,
+        Shape::Insert => ActionStatement::Insert,
+    }
+}
+
+/// Convert neutral column commands to `OpenFGA` commands.
+pub(crate) fn columns(
+    columns: BTreeMap<sql_traits::parity::ColumnCommand, Vec<String>>,
+) -> BTreeMap<ColumnCommand, Vec<String>> {
+    columns
+        .into_iter()
+        .map(|(command, names)| {
+            let command = match command {
+                sql_traits::parity::ColumnCommand::Select => ColumnCommand::Select,
+                sql_traits::parity::ColumnCommand::Insert => ColumnCommand::Insert,
+                sql_traits::parity::ColumnCommand::Update => ColumnCommand::Update,
+            };
+            (command, names)
+        })
+        .collect()
+}
 
 /// The rows and columns one check about one statement names.
 pub(crate) struct Probe<'a> {
@@ -75,7 +104,11 @@ impl Model {
             Ok(parsed) => parsed,
             Err(error) => return Ok(Prepared::Refused(error.to_string())),
         };
-        let deployment = case.config.deployment()?;
+        let deployment = if case.name == "connetto_deployment" {
+            crate::connetto::deployment()?
+        } else {
+            case.config.deployment()?
+        };
         let sets = deployment
             .settings()
             .iter()
@@ -437,9 +470,12 @@ mod tests {
     /// Live column checks enforce both row ownership and projection privileges.
     #[test]
     fn live_column_answers() -> Result<()> {
-        let mut case = Case::read(
-            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("cases/grant_without_update"),
-        )?;
+        let mut case = sql_traits::parity::fixtures()
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .find(|fixture| fixture.case.name == "grant_without_update")
+            .context("No grant_without_update fixture")?
+            .case;
         case.schema = case
             .schema
             .replace("GRANT SELECT, INSERT", "GRANT SELECT (id), INSERT");
@@ -455,7 +491,7 @@ mod tests {
         let read = |case: &Case| Probe {
             existing: Some(&row),
             resulting: None,
-            columns: case.config.tables[0].read_columns(),
+            columns: columns(case.config.tables[0].read_columns()),
         };
         let table = &case.config.tables[0];
         assert_eq!(
@@ -551,7 +587,7 @@ mod tests {
         let probe = Probe {
             existing: Some(&row),
             resulting: None,
-            columns: case.config.tables[0].read_columns(),
+            columns: columns(case.config.tables[0].read_columns()),
         };
         let table = &case.config.tables[0];
         let caller = &case.config.callers[0];
