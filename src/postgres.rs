@@ -14,10 +14,9 @@ use diesel::{
 use serde_json::Value;
 use sqlparser::{ast::Statement, dialect::PostgreSqlDialect, parser::Parser};
 
-use crate::{
-    Outcome,
-    case::{Caller, Case, Table, identifier, text_of},
-};
+use sql_traits::parity::{Caller, Case, Table, identifier, text_of};
+
+use crate::Outcome;
 
 #[derive(QueryableByName)]
 pub(crate) struct JsonRow {

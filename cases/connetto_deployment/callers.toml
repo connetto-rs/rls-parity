@@ -1,5 +1,3 @@
-source = "connetto"
-
 [[tables]]
 name = "orders"
 key = ["id"]

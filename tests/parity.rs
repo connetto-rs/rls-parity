@@ -1,11 +1,12 @@
 use std::{path::Path, time::Duration};
 
 use rls_parity::{
-    Answer, CaseKnown, Direction, Engine, Known, KnownList, Measurements, Recorded, compare,
-    generate, observe_cases, read_known, record,
+    Answer, KnownList, Measurements, generate, observe_cases, observe_suite, read_known, record,
+    recorded, verify_recorded,
 };
+use sql_traits::parity::{Case, CaseKnown, Engine, EngineAnswer, Recorded, fixtures};
 
-/// Every recorded discrepancy must be necessary and must remain a discrepancy.
+/// Embedded oracles match PostgreSQL and both engines satisfy shared judgements.
 #[test]
 fn live_known_entry_acceptance() {
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL for PostgreSQL 18");
@@ -13,19 +14,15 @@ fn live_known_entry_acceptance() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     omitted_table_seed_is_skipped(root, &database_url, &openfga_url)
         .expect("omitted replica table observations");
-    let measurements = observe_cases(&root.join("cases"), &database_url, &openfga_url)
+    let measurements = observe_suite(&root.join("cases"), &database_url, &openfga_url)
         .expect("live three-engine observations");
-    let mut known = read_known(&root.join("known.toml")).expect("known discrepancies");
-    assert!(
-        !known.known.is_empty() && !known.refusal.is_empty(),
-        "removal proof needs a known discrepancy of each kind"
-    );
-    assert_eq!(compare(&measurements, &known), Vec::<String>::new());
-    removing_each_entry_reports_exactly_that_divergence(&measurements, &mut known);
-    stale_agreement_reports_three_answers(&measurements, &mut known);
-    recorded_fixtures_hold_each_case(root, &measurements, &known).expect("recorded fixtures");
+    assert_eq!(measurements.acceptances.len(), 27);
+    assert!(measurements.errors.is_empty(), "{:?}", measurements.errors);
+    recorded_fixtures_hold_each_case(root, &measurements).expect("recorded fixtures");
+    removing_each_entry_reports_exactly_that_divergence(&measurements)
+        .expect("shared known entries");
     fixture_edge_cases(root, &database_url, &openfga_url).expect("edge-case observations");
-    let listed = read_known(&root.join("known.toml")).expect("known discrepancies");
+    let listed = read_known(&root.join("known.toml")).expect("known constructs");
     generated_failure_replays(root, &database_url, &openfga_url, &listed)
         .expect("generated observations");
 }
@@ -45,7 +42,7 @@ fn generated_failure_replays(
     let failed = generate(0, one_draw, &unlisted, database_url, openfga_url, &failures)?;
     assert_eq!(failed, 1);
     let replayed = observe_cases(&failures, database_url, openfga_url)?;
-    assert_ne!(compare(&replayed, &unlisted), Vec::<String>::new());
+    assert_ne!(replayed.errors, Vec::<String>::new());
     let listed = directory.path().join("listed");
     assert_eq!(
         generate(0, one_draw, known, database_url, openfga_url, &listed)?,
@@ -55,179 +52,114 @@ fn generated_failure_replays(
     Ok(())
 }
 
-/// `record` writes every files case, leaves out the connetto case, copies each case's files
-/// unchanged, and writes exactly that case's PostgreSQL answers and known entries.
+/// Exported fixtures retain their cases, live answers and engine-known entries.
 fn recorded_fixtures_hold_each_case(
     root: &Path,
     measurements: &Measurements,
-    known: &KnownList,
 ) -> anyhow::Result<()> {
     let directory = tempfile::tempdir_in(root.join("target"))?;
     let out = directory.path().join("fixtures");
-    let cases = root.join("cases");
-    let written = record(&cases, measurements, known, &out)?;
-    assert_eq!(written, measurements.acceptances.len() - 1);
+    assert_eq!(record(measurements, &out)?, 26);
     assert!(!out.join("connetto_deployment").exists());
-    for acceptance in &measurements.acceptances {
-        let name = &acceptance.case;
-        if name == "connetto_deployment" {
-            continue;
+    for fixture in fixtures() {
+        let fixture = fixture?;
+        let path = out.join(&fixture.case.name);
+        let exported = Case::parse(
+            &fixture.case.name,
+            std::fs::read_to_string(path.join("schema.sql"))?,
+            std::fs::read_to_string(path.join("seed.sql"))?,
+            std::fs::read_to_string(path.join("callers.toml"))?,
+        )?;
+        assert_eq!(exported, fixture.case);
+        let oracle: Recorded =
+            toml::from_str(&std::fs::read_to_string(path.join("postgres.toml"))?)?;
+        verify_recorded(&fixture.case.name, &fixture.recorded, &oracle)?;
+        if fixture.known.is_empty() {
+            assert!(!path.join("known.toml").exists());
+        } else {
+            let known: CaseKnown =
+                toml::from_str(&std::fs::read_to_string(path.join("known.toml"))?)?;
+            assert_eq!(known, fixture.known);
         }
-        let case = out.join(name);
-        for file in ["schema.sql", "seed.sql", "callers.toml"] {
-            assert_eq!(
-                std::fs::read(case.join(file))?,
-                std::fs::read(cases.join(name).join(file))?,
-                "{name}/{file}"
-            );
-        }
-        let recorded: Recorded =
-            toml::from_str(&std::fs::read_to_string(case.join("postgres.toml"))?)?;
-        let expected: Vec<_> = measurements
+    }
+    let fixture = fixtures().next().expect("embedded fixture")?;
+    let oracle = recorded(
+        measurements
             .observations
             .iter()
-            .filter(|observation| &observation.case == name)
-            .map(|observation| {
-                (
-                    observation.caller.as_str(),
-                    observation.row.as_str(),
-                    observation.statement.as_str(),
-                    &observation.postgres,
-                )
-            })
-            .collect();
-        let answers: Vec<_> = recorded
-            .answer
+            .filter(|observation| observation.case == fixture.case.name),
+    );
+    let mut changed = fixture.recorded;
+    changed.answer[0].postgres = Answer::Error("mutated recorded answer".into());
+    let error = verify_recorded(&fixture.case.name, &changed, &oracle)
+        .expect_err("mutated recording must disagree with live PostgreSQL");
+    assert!(error.to_string().contains("mutated recorded answer"));
+    Ok(())
+}
+
+/// Removing each shared known entry exposes exactly its live disagreement.
+fn removing_each_entry_reports_exactly_that_divergence(
+    measurements: &Measurements,
+) -> anyhow::Result<()> {
+    for fixture in fixtures() {
+        let mut fixture = fixture?;
+        let acceptance = measurements
+            .acceptances
             .iter()
-            .map(|answer| {
-                (
-                    answer.caller.as_str(),
-                    answer.row.as_str(),
-                    answer.statement.as_str(),
-                    &answer.postgres,
-                )
-            })
-            .collect();
-        assert_eq!(answers, expected, "{name}/postgres.toml");
-        let listed = known
-            .known
-            .iter()
-            .filter(|entry| &entry.case == name)
-            .count();
-        let refused = known
-            .refusal
-            .iter()
-            .filter(|entry| &entry.case == name)
-            .count();
-        let path = case.join("known.toml");
-        if listed + refused == 0 {
-            assert!(!path.exists(), "{name} has no known entries");
-            continue;
-        }
-        let case_known: CaseKnown = toml::from_str(&std::fs::read_to_string(path)?)?;
-        let engines = [&case_known.sqlite, &case_known.openfga];
-        assert_eq!(
-            engines.iter().map(|engine| engine.row.len()).sum::<usize>(),
-            listed,
-            "{name}/known.toml rows"
-        );
-        assert_eq!(
-            engines
+            .find(|acceptance| acceptance.case == fixture.case.name)
+            .expect("measured case");
+        for engine in [Engine::Sqlite, Engine::Openfga] {
+            let answers: Vec<_> = measurements
+                .observations
                 .iter()
-                .filter(|engine| engine.refusal.is_some())
-                .count(),
-            refused,
-            "{name}/known.toml refusals"
-        );
+                .filter(|observation| observation.case == fixture.case.name)
+                .map(|observation| EngineAnswer {
+                    caller: observation.caller.clone(),
+                    row: observation.row.clone(),
+                    statement: observation.statement.clone(),
+                    answer: match engine {
+                        Engine::Sqlite => observation.sqlite.clone(),
+                        Engine::Openfga => observation.openfga.clone(),
+                    },
+                })
+                .collect();
+            let refusal = match engine {
+                Engine::Sqlite => acceptance.sqlite.as_deref(),
+                Engine::Openfga => acceptance.openfga.as_deref(),
+            };
+            let original = fixture.known.clone();
+            let count = fixture.known.engine(engine).row.len();
+            for index in 0..count {
+                let known = match engine {
+                    Engine::Sqlite => &mut fixture.known.sqlite,
+                    Engine::Openfga => &mut fixture.known.openfga,
+                };
+                known.row.remove(index);
+                assert_eq!(fixture.judge(engine, refusal, &answers).len(), 1);
+                fixture.known = original.clone();
+            }
+            let known = match engine {
+                Engine::Sqlite => &mut fixture.known.sqlite,
+                Engine::Openfga => &mut fixture.known.openfga,
+            };
+            if known.refusal.take().is_some() {
+                assert_eq!(fixture.judge(engine, refusal, &answers).len(), 1);
+                fixture.known = original;
+            }
+        }
     }
     Ok(())
 }
 
-/// Removing a known entry exposes exactly its measured engine disagreement.
-fn removing_each_entry_reports_exactly_that_divergence(
-    measurements: &Measurements,
-    known: &mut KnownList,
-) {
-    for index in 0..known.known.len() {
-        let entry = known.known.remove(index);
-        let witness = measurements
-            .observations
-            .iter()
-            .find(|observation| {
-                observation.case == entry.case
-                    && observation.caller == entry.caller
-                    && observation.row == entry.row
-                    && observation.statement == entry.statement
-            })
-            .expect("known entry has a live witness");
-        assert_eq!(
-            compare(measurements, known),
-            [format!(
-                "Unlisted {:?} {:?} {witness:?}",
-                entry.engine, entry.direction
-            )],
-            "removed {entry:?}"
-        );
-        known.known.insert(index, entry);
+/// Find one embedded case for a local variation.
+fn embedded_case(name: &str) -> anyhow::Result<Case> {
+    for fixture in fixtures() {
+        let fixture = fixture?;
+        if fixture.case.name == name {
+            return Ok(fixture.case);
+        }
     }
-    for index in 0..known.refusal.len() {
-        let entry = known.refusal.remove(index);
-        let witness = measurements
-            .acceptances
-            .iter()
-            .find(|acceptance| acceptance.case == entry.case)
-            .expect("known refusal has a live witness");
-        assert_eq!(
-            compare(measurements, known),
-            [format!("Unlisted {:?} refusal {witness:?}", entry.engine)],
-            "removed {entry:?}"
-        );
-        known.refusal.insert(index, entry);
-    }
-}
-
-/// A stale entry includes the complete agreeing observation in its diagnostic.
-fn stale_agreement_reports_three_answers(measurements: &Measurements, known: &mut KnownList) {
-    let witness = measurements
-        .observations
-        .iter()
-        .find(|observation| {
-            observation.case == "grant_without_update"
-                && observation.caller == "alice"
-                && observation.row == "docs:1"
-        })
-        .expect("agreeing case witness");
-    assert_eq!(witness.postgres, Answer::Visible);
-    assert_eq!(witness.sqlite, Answer::Visible);
-    assert_eq!(witness.openfga, Answer::Visible);
-    known.known.push(Known {
-        case: witness.case.clone(),
-        caller: witness.caller.clone(),
-        row: witness.row.clone(),
-        statement: witness.statement.clone(),
-        engine: Engine::Sqlite,
-        direction: Direction::Narrower,
-        finding: "deliberately stale acceptance witness".into(),
-    });
-    let errors = compare(measurements, known);
-    assert_eq!(errors.len(), 1);
-    for required in [
-        "Stale known entry",
-        &witness.case,
-        &witness.caller,
-        &witness.row,
-        &format!("{:?}", witness.statement),
-        "postgres: Visible",
-        "sqlite: Visible",
-        "openfga: Visible",
-    ] {
-        assert!(
-            errors[0].contains(required),
-            "missing {required} in {}",
-            errors[0]
-        );
-    }
-    known.known.pop();
+    anyhow::bail!("No embedded case {name}")
 }
 
 /// Empty suites and unreadable or malformed inputs retain their path in errors.
@@ -260,21 +192,22 @@ fn invalid_suite_inputs() {
 
 /// String keys, missing row identity and undeclared roles retain distinct outcomes.
 fn fixture_edge_cases(root: &Path, database_url: &str, openfga_url: &str) -> anyhow::Result<()> {
-    let schema = include_str!("../cases/grant_without_update/schema.sql");
-    let seed = include_str!("../cases/grant_without_update/seed.sql");
-    let callers = include_str!("../cases/grant_without_update/callers.toml");
+    let source = embedded_case("grant_without_update")?;
+    let schema = source.schema.as_str();
+    let seed = source.seed.as_str();
+    let callers = toml::to_string(&source.config)?;
     for (name, schema, seed, callers) in [
         (
             "text_key",
             schema.replace("id INTEGER", "id TEXT"),
             seed.replace("(1,", "('one',").replace("(2,", "('two',"),
-            callers.to_owned(),
+            callers.clone(),
         ),
         (
             "missing_key",
             schema.replace(" PRIMARY KEY", ""),
             seed.into(),
-            callers.into(),
+            callers.clone(),
         ),
         (
             "missing_role",
@@ -325,11 +258,13 @@ fn omitted_table_seed_is_skipped(
     let directory = tempfile::tempdir_in(root.join("target"))?;
     let case = directory.path().join("insert_only_grant");
     std::fs::create_dir(&case)?;
-    for filename in ["schema.sql", "seed.sql", "callers.toml"] {
-        std::fs::copy(
-            root.join("cases/insert_only_grant").join(filename),
-            case.join(filename),
-        )?;
+    let source = embedded_case("insert_only_grant")?;
+    for (filename, contents) in [
+        ("schema.sql", source.schema),
+        ("seed.sql", source.seed),
+        ("callers.toml", toml::to_string(&source.config)?),
+    ] {
+        std::fs::write(case.join(filename), contents)?;
     }
     let observations = observe_cases(directory.path(), database_url, openfga_url)?.observations;
     let reads: Vec<_> = observations

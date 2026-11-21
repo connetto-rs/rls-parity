@@ -7,13 +7,16 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use rls2fga::types::ActionStatement;
 use serde_json::Value;
+use sql_traits::parity::{
+    Caller, Case, CaseKnown, Engine, EngineAnswer, Fixture, Recorded, RecordedAnswer, Shape, Table,
+    Write, fixtures, identifier,
+};
 
 use crate::{
-    Acceptance, Answer, KnownList, Measurements, Observation, Outcome, Prepared,
-    case::{Caller, Case, Shape, Table, Write, identifier},
-    openfga::{Model, Probe, Verdict},
+    Acceptance, Answer, KnownList, Measurements, Observation, Outcome, Prepared, case, connetto,
+    openfga::{Model, Probe, Verdict, action, columns},
     postgres::Database,
-    sqlite::Replica,
+    verify_recorded,
 };
 
 /// A suite input or engine setup failure.
@@ -82,27 +85,123 @@ pub fn observe_cases(
     directories.sort();
     let mut measurements = Measurements::default();
     for directory in directories {
-        let (acceptance, observations) =
-            run_case(&directory, database_url, openfga_url).map_err(|source| RunError::Case {
+        let case = case::read(&directory).map_err(|source| RunError::Case {
+            path: directory.clone(),
+            source,
+        })?;
+        let fixture = Fixture {
+            case,
+            recorded: Recorded::default(),
+            known: CaseKnown::default(),
+        };
+        measure_fixture(fixture, false, database_url, openfga_url, &mut measurements).map_err(
+            |source| RunError::Case {
                 path: directory,
                 source,
-            })?;
-        measurements.acceptances.push(acceptance);
-        measurements.observations.extend(observations);
+            },
+        )?;
     }
     Ok(measurements)
+}
+
+/// Measure embedded fixtures and the local cases.
+///
+/// # Errors
+/// Returns the case and cause when loading or measuring fails.
+pub fn observe_suite(root: &Path, database_url: &str, openfga_url: &str) -> Result<Measurements> {
+    let mut measurements = Measurements::default();
+    for fixture in fixtures() {
+        measure_fixture(fixture?, true, database_url, openfga_url, &mut measurements)?;
+    }
+    let local = observe_cases(root, database_url, openfga_url)?;
+    measurements.acceptances.extend(local.acceptances);
+    measurements.observations.extend(local.observations);
+    measurements.errors.extend(local.errors);
+    Ok(measurements)
+}
+
+/// Judge measured answers through the shared fixture contract.
+fn measure_fixture(
+    mut fixture: Fixture,
+    has_recording: bool,
+    database_url: &str,
+    openfga_url: &str,
+    measurements: &mut Measurements,
+) -> Result<()> {
+    let case = &fixture.case;
+    let (mut acceptance, observations) = run_case(case, database_url, openfga_url)?;
+    let (answer, openfga): (Vec<_>, Vec<_>) = observations.into_iter().unzip();
+    let live = Recorded { answer };
+    if has_recording && let Err(error) = verify_recorded(&case.name, &fixture.recorded, &live) {
+        measurements.errors.push(error.to_string());
+    }
+    let owner = if case.name == "connetto_deployment" {
+        connetto::replica_options()?
+    } else {
+        pg2sqlite::parity::case_options(case)?
+    };
+    let probes: Vec<_> = live
+        .answer
+        .iter()
+        .map(|answer| pg2sqlite::parity::Probe {
+            caller: &answer.caller,
+            row: &answer.row,
+            statement: &answer.statement,
+        })
+        .collect();
+    let replay = pg2sqlite::parity::replay(case, &owner, &probes)
+        .with_context(|| format!("Replaying SQLite for {}", case.name))?;
+    fixture.recorded = live;
+    let openfga: Vec<_> = fixture
+        .recorded
+        .answer
+        .iter()
+        .zip(openfga)
+        .map(|(recorded, answer)| EngineAnswer {
+            caller: recorded.caller.clone(),
+            row: recorded.row.clone(),
+            statement: recorded.statement.clone(),
+            answer,
+        })
+        .collect();
+    for discrepancy in fixture
+        .judge(Engine::Sqlite, replay.refusal.as_deref(), &replay.answers)
+        .into_iter()
+        .chain(fixture.judge(Engine::Openfga, acceptance.openfga.as_deref(), &openfga))
+    {
+        measurements.errors.push(discrepancy.to_string());
+    }
+    acceptance.sqlite = replay.refusal;
+    for ((recorded, sqlite), openfga) in fixture
+        .recorded
+        .answer
+        .into_iter()
+        .zip(replay.answers)
+        .zip(openfga)
+    {
+        measurements.observations.push(Observation {
+            case: fixture.case.name.clone(),
+            caller: recorded.caller,
+            row: recorded.row,
+            statement: recorded.statement,
+            postgres: recorded.postgres,
+            sqlite: sqlite.answer,
+            openfga: openfga.answer,
+        });
+    }
+    measurements.acceptances.push(acceptance);
+    Ok(())
 }
 
 /// Measure whether each translator accepts the schema, then every caller and seeded row
 /// of every table, before evaluating the known list.
 fn run_case(
-    path: &Path,
+    case: &Case,
     database_url: &str,
     openfga_url: &str,
-) -> Result<(Acceptance, Vec<Observation>)> {
-    let case = Case::read(path)?;
+) -> Result<(Acceptance, Vec<(RecordedAnswer, Answer)>)> {
     let mut database =
-        Database::create(database_url, &case).with_context(|| format!("Creating {}", case.name))?;
+        Database::create(database_url, case).with_context(|| format!("Creating {}", case.name))?;
     let mut rows = BTreeMap::new();
     for table in &case.config.tables {
         let seeded = database.rows(&identifier(&table.name))?;
@@ -114,28 +213,25 @@ fn run_case(
         );
         rows.insert(table.name.clone(), seeded);
     }
-    let replicas = replicas(&case)?;
-    let model = Model::create(openfga_url, &case, &mut database)
+    let model = Model::create(openfga_url, case, &mut database)
         .with_context(|| format!("Loading OpenFGA for {}", case.name))?;
-    let acceptance = acceptance(&case, &replicas, &model);
-    let mut engines = Engines {
-        database,
-        replicas,
-        model,
-    };
+    let acceptance = acceptance(case, &model);
+    let mut engines = Engines { database, model };
     let mut observations = Vec::new();
     for table in &case.config.tables {
         observations.extend(measure_reads(
-            &case,
+            case,
             table,
             &rows[&table.name],
             &mut engines,
         )?);
     }
     for write in case.writes() {
-        let table = case.table(&write.table)?;
+        let table = case
+            .table(&write.table)
+            .context("Write targets undeclared table")?;
         observations.extend(measure_write(
-            &case,
+            case,
             table,
             write,
             &rows[&table.name],
@@ -149,10 +245,9 @@ fn run_case(
     Ok((acceptance, observations))
 }
 
-/// The three engines one case is measured on.
+/// The live PostgreSQL database and `OpenFGA` model.
 struct Engines {
     database: Database,
-    replicas: BTreeMap<String, Prepared<Replica>>,
     model: Prepared<Model>,
 }
 
@@ -162,22 +257,15 @@ fn measure_reads(
     table: &Table,
     rows: &[Value],
     engines: &mut Engines,
-) -> Result<Vec<Observation>> {
+) -> Result<Vec<(RecordedAnswer, Answer)>> {
     let mut observations = Vec::new();
-    let read_columns = table.read_columns();
+    let read_columns = columns(table.read_columns());
     for shape in case.reads(table) {
         let statement = table.statement(shape);
-        for (caller_index, caller) in case.config.callers.iter().enumerate() {
+        for caller in &case.config.callers {
             let postgres = engines.database.visible(table, caller, &statement);
-            let sqlite = on_replica(role_replica(&mut engines.replicas, caller)?, |replica| {
-                replica.visible(table, caller_index, &statement)
-            });
             for row in rows {
                 let key = table.row_key(|column| row.get(column))?;
-                let sqlite_answer = match &sqlite {
-                    Err(reason) => Answer::Refused(reason.clone()),
-                    Ok(answer) => visibility(answer, &key),
-                };
                 let probe = Probe {
                     existing: Some(row),
                     resulting: None,
@@ -186,22 +274,22 @@ fn measure_reads(
                 let openfga_answer = match &engines.model {
                     Prepared::Refused(reason) => Answer::Refused(reason.clone()),
                     Prepared::Ready(model) => {
-                        match model.permits(table, caller, shape.action(), &probe) {
+                        match model.permits(table, caller, action(shape), &probe) {
                             Ok(Verdict::Changed) => Answer::Visible,
                             Ok(Verdict::Skipped | Verdict::Aborted) => Answer::Hidden,
                             Err(error) => Answer::Error(format!("{error:#}")),
                         }
                     }
                 };
-                observations.push(Observation {
-                    case: case.name.clone(),
-                    caller: caller.name.clone(),
-                    row: format!("{}:{key}", table.name),
-                    statement: statement.clone(),
-                    postgres: visibility(&postgres, &key),
-                    sqlite: sqlite_answer,
-                    openfga: openfga_answer,
-                });
+                observations.push((
+                    RecordedAnswer {
+                        caller: caller.name.clone(),
+                        row: format!("{}:{key}", table.name),
+                        statement: statement.clone(),
+                        postgres: visibility(&postgres, &key),
+                    },
+                    openfga_answer,
+                ));
             }
         }
     }
@@ -215,16 +303,13 @@ fn measure_write(
     write: &Write,
     rows: &[Value],
     engines: &mut Engines,
-) -> Result<Vec<Observation>> {
+) -> Result<Vec<(RecordedAnswer, Answer)>> {
     let mut observations = Vec::new();
     let targets = targets(table, write, rows, &mut engines.database)?;
-    let columns = write.columns(&table.key);
-    for (caller_index, caller) in case.config.callers.iter().enumerate() {
+    let columns = columns(write.columns(&table.key));
+    for caller in &case.config.callers {
         for target in &targets {
             let postgres = engines.database.write(table, caller, &target.statement);
-            let sqlite = on_replica(role_replica(&mut engines.replicas, caller)?, |replica| {
-                replica.write(table, caller_index, &target.statement)
-            });
             let probes: Vec<Probe> = target
                 .rows
                 .iter()
@@ -235,21 +320,17 @@ fn measure_write(
                 })
                 .collect();
             let openfga =
-                openfga_answers(&engines.model, table, caller, write.shape.action(), &probes);
+                openfga_answers(&engines.model, table, caller, action(write.shape), &probes);
             for (row, openfga_answer) in target.rows.iter().zip(openfga) {
-                let sqlite_answer = match &sqlite {
-                    Err(reason) => Answer::Refused(reason.clone()),
-                    Ok(outcome) => written(outcome, &row.key),
-                };
-                observations.push(Observation {
-                    case: case.name.clone(),
-                    caller: caller.name.clone(),
-                    row: format!("{}:{}", table.name, row.key),
-                    statement: target.statement.clone(),
-                    postgres: written(&postgres, &row.key),
-                    sqlite: sqlite_answer,
-                    openfga: openfga_answer,
-                });
+                observations.push((
+                    RecordedAnswer {
+                        caller: caller.name.clone(),
+                        row: format!("{}:{}", table.name, row.key),
+                        statement: target.statement.clone(),
+                        postgres: written(&postgres, &row.key),
+                    },
+                    openfga_answer,
+                ));
             }
         }
     }
@@ -287,51 +368,16 @@ fn openfga_answers(
         .collect()
 }
 
-/// Each translator's verdict on the case's schema, the way connetto gates it. `pg2sqlite`
-/// refuses the schema when it refuses any acting role's translation.
-fn acceptance(
-    case: &Case,
-    replicas: &BTreeMap<String, Prepared<Replica>>,
-    model: &Prepared<Model>,
-) -> Acceptance {
-    let refusals: Vec<String> = replicas
-        .iter()
-        .filter_map(|(role, replica)| match replica {
-            Prepared::Ready(_) => None,
-            Prepared::Refused(reason) => Some(format!("{role}: {reason}")),
-        })
-        .collect();
+/// The `OpenFGA` translator's schema verdict.
+fn acceptance(case: &Case, model: &Prepared<Model>) -> Acceptance {
     Acceptance {
         case: case.name.clone(),
-        sqlite: (!refusals.is_empty()).then(|| refusals.join("\n")),
+        sqlite: None,
         openfga: match model {
             Prepared::Ready(model) => model.divergence().map(ToOwned::to_owned),
             Prepared::Refused(reason) => Some(reason.clone()),
         },
     }
-}
-
-/// The replica `pg2sqlite` translated for the caller's acting role.
-fn role_replica<'replicas>(
-    replicas: &'replicas mut BTreeMap<String, Prepared<Replica>>,
-    caller: &Caller,
-) -> Result<&'replicas mut Prepared<Replica>> {
-    replicas
-        .get_mut(&caller.role)
-        .context("No replica for the caller's acting role")
-}
-
-/// Translate one replica per acting role the callers name.
-fn replicas(case: &Case) -> Result<BTreeMap<String, Prepared<Replica>>> {
-    case.config
-        .acting_roles()
-        .into_iter()
-        .map(|role| {
-            let replica = Replica::create(case, role)
-                .with_context(|| format!("Loading SQLite for {} acting as {role}", case.name))?;
-            Ok((role.to_owned(), replica))
-        })
-        .collect()
 }
 
 /// One write statement a caller runs and the rows it answers for.
@@ -401,22 +447,6 @@ fn targets<'a>(
                 })
             })
             .collect(),
-    }
-}
-
-/// Run `measure` on a loaded replica, `Err` holding why pg2sqlite refused the schema or
-/// the statement and the inner error an execution failure.
-fn on_replica<T>(
-    replica: &mut Prepared<Replica>,
-    measure: impl FnOnce(&mut Replica) -> Result<Prepared<T>>,
-) -> std::result::Result<Result<T>, String> {
-    match replica {
-        Prepared::Ready(replica) => match measure(replica) {
-            Ok(Prepared::Ready(value)) => Ok(Ok(value)),
-            Ok(Prepared::Refused(reason)) => Err(reason),
-            Err(error) => Ok(Err(error)),
-        },
-        Prepared::Refused(reason) => Err(reason.clone()),
     }
 }
 
