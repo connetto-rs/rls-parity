@@ -2,20 +2,19 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
+    sync::LazyLock,
 };
 
 use anyhow::{Context, Result, ensure};
-use rls2fga::types::ActionStatement;
+use rls2fga::parity::Database;
 use serde_json::Value;
 use sql_traits::parity::{
-    Caller, Case, CaseKnown, Engine, EngineAnswer, Fixture, Recorded, RecordedAnswer, Shape, Table,
-    Write, fixtures, identifier,
+    Case, CaseKnown, Engine, Fixture, Recorded, RecordedAnswer, Shape, Table, Write, fixtures,
+    identifier,
 };
 
 use crate::{
-    Acceptance, Answer, KnownList, Measurements, Observation, Outcome, Prepared, case, connetto,
-    openfga::{Model, Probe, Verdict, action, columns},
-    postgres::Database,
+    Acceptance, Answer, KnownList, Measurements, Observation, Outcome, case, connetto, postgres,
     verify_recorded,
 };
 
@@ -145,10 +144,17 @@ fn measure_fixture(
     openfga_url: &str,
     measurements: &mut Measurements,
 ) -> Result<()> {
+    static RUNTIME: LazyLock<std::io::Result<tokio::runtime::Runtime>> = LazyLock::new(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+    });
     let case = &fixture.case;
-    let (mut acceptance, observations) = run_case(case, database_url, openfga_url)?;
-    let (answer, openfga): (Vec<_>, Vec<_>) = observations.into_iter().unzip();
-    let live = Recorded { answer };
+    let mut database =
+        Database::create(database_url, case).with_context(|| format!("Creating {}", case.name))?;
+    let live = Recorded {
+        answer: run_case(case, &mut database)?,
+    };
     if has_recording && let Err(error) = verify_recorded(&case.name, &fixture.recorded, &live) {
         measurements.errors.push(error.to_string());
     }
@@ -168,33 +174,45 @@ fn measure_fixture(
         .collect();
     let replay = pg2sqlite::parity::replay(case, &owner, &probes)
         .with_context(|| format!("Replaying SQLite for {}", case.name))?;
+    let deployment = if case.name == "connetto_deployment" {
+        connetto::deployment()?
+    } else {
+        case.config.deployment()?
+    };
+    let runtime = RUNTIME
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!("Creating the replay runtime failed {error}"))?;
+    let openfga = runtime.block_on(rls2fga::parity::replay(
+        case,
+        &deployment,
+        live.answer.iter().map(rls2fga::parity::Probe::from),
+        &mut database,
+        openfga_url,
+    ))?;
+    database.cleanup()?;
     fixture.recorded = live;
-    let openfga: Vec<_> = fixture
-        .recorded
-        .answer
-        .iter()
-        .zip(openfga)
-        .map(|(recorded, answer)| EngineAnswer {
-            caller: recorded.caller.clone(),
-            row: recorded.row.clone(),
-            statement: recorded.statement.clone(),
-            answer,
-        })
-        .collect();
     for discrepancy in fixture
         .judge(Engine::Sqlite, replay.refusal.as_deref(), &replay.answers)
         .into_iter()
-        .chain(fixture.judge(Engine::Openfga, acceptance.openfga.as_deref(), &openfga))
+        .chain(fixture.judge(
+            Engine::Openfga,
+            openfga.refusal.as_deref(),
+            &openfga.answers,
+        ))
     {
         measurements.errors.push(discrepancy.to_string());
     }
-    acceptance.sqlite = replay.refusal;
+    let acceptance = Acceptance {
+        case: fixture.case.name.clone(),
+        sqlite: replay.refusal,
+        openfga: openfga.refusal,
+    };
     for ((recorded, sqlite), openfga) in fixture
         .recorded
         .answer
         .into_iter()
         .zip(replay.answers)
-        .zip(openfga)
+        .zip(openfga.answers)
     {
         measurements.observations.push(Observation {
             case: fixture.case.name.clone(),
@@ -210,15 +228,8 @@ fn measure_fixture(
     Ok(())
 }
 
-/// Measure whether each translator accepts the schema, then every caller and seeded row
-/// of every table, before evaluating the known list.
-fn run_case(
-    case: &Case,
-    database_url: &str,
-    openfga_url: &str,
-) -> Result<(Acceptance, Vec<(RecordedAnswer, Answer)>)> {
-    let mut database =
-        Database::create(database_url, case).with_context(|| format!("Creating {}", case.name))?;
+/// Measure each caller's statements against the live PostgreSQL oracle.
+fn run_case(case: &Case, database: &mut Database) -> Result<Vec<RecordedAnswer>> {
     let mut rows = BTreeMap::new();
     for table in &case.config.tables {
         let seeded = database.rows(&identifier(&table.name))?;
@@ -230,18 +241,9 @@ fn run_case(
         );
         rows.insert(table.name.clone(), seeded);
     }
-    let model = Model::create(openfga_url, case, &mut database)
-        .with_context(|| format!("Loading OpenFGA for {}", case.name))?;
-    let acceptance = acceptance(case, &model);
-    let mut engines = Engines { database, model };
     let mut observations = Vec::new();
     for table in &case.config.tables {
-        observations.extend(measure_reads(
-            case,
-            table,
-            &rows[&table.name],
-            &mut engines,
-        )?);
+        observations.extend(measure_reads(case, table, &rows[&table.name], database)?);
     }
     for write in case.writes() {
         let table = case
@@ -252,20 +254,10 @@ fn run_case(
             table,
             write,
             &rows[&table.name],
-            &mut engines,
+            database,
         )?);
     }
-    if let Prepared::Ready(mut model) = engines.model {
-        model.cleanup()?;
-    }
-    engines.database.cleanup()?;
-    Ok((acceptance, observations))
-}
-
-/// The live PostgreSQL database and `OpenFGA` model.
-struct Engines {
-    database: Database,
-    model: Prepared<Model>,
+    Ok(observations)
 }
 
 /// Measure every read shape on `table` for every caller and seeded row.
@@ -273,40 +265,21 @@ fn measure_reads(
     case: &Case,
     table: &Table,
     rows: &[Value],
-    engines: &mut Engines,
-) -> Result<Vec<(RecordedAnswer, Answer)>> {
+    database: &mut Database,
+) -> Result<Vec<RecordedAnswer>> {
     let mut observations = Vec::new();
-    let read_columns = columns(table.read_columns());
     for shape in case.reads(table) {
         let statement = table.statement(shape);
         for caller in &case.config.callers {
-            let postgres = engines.database.visible(table, caller, &statement);
+            let postgres = postgres::visible(database.connection(), table, caller, &statement);
             for row in rows {
                 let key = table.row_key(|column| row.get(column))?;
-                let probe = Probe {
-                    existing: Some(row),
-                    resulting: None,
-                    columns: read_columns.clone(),
-                };
-                let openfga_answer = match &engines.model {
-                    Prepared::Refused(reason) => Answer::Refused(reason.clone()),
-                    Prepared::Ready(model) => {
-                        match model.permits(table, caller, action(shape), &probe) {
-                            Ok(Verdict::Changed) => Answer::Visible,
-                            Ok(Verdict::Skipped | Verdict::Aborted) => Answer::Hidden,
-                            Err(error) => Answer::Error(format!("{error:#}")),
-                        }
-                    }
-                };
-                observations.push((
-                    RecordedAnswer {
-                        caller: caller.name.clone(),
-                        row: format!("{}:{key}", table.name),
-                        statement: statement.clone(),
-                        postgres: visibility(&postgres, &key),
-                    },
-                    openfga_answer,
-                ));
+                observations.push(RecordedAnswer {
+                    caller: caller.name.clone(),
+                    row: format!("{}:{key}", table.name),
+                    statement: statement.clone(),
+                    postgres: visibility(&postgres, &key),
+                });
             }
         }
     }
@@ -319,148 +292,50 @@ fn measure_write(
     table: &Table,
     write: &Write,
     rows: &[Value],
-    engines: &mut Engines,
-) -> Result<Vec<(RecordedAnswer, Answer)>> {
+    database: &mut Database,
+) -> Result<Vec<RecordedAnswer>> {
     let mut observations = Vec::new();
-    let targets = targets(table, write, rows, &mut engines.database)?;
-    let columns = columns(write.columns(&table.key));
+    let targets = targets(table, write, rows)?;
     for caller in &case.config.callers {
         for target in &targets {
-            let postgres = engines.database.write(table, caller, &target.statement);
-            let probes: Vec<Probe> = target
-                .rows
-                .iter()
-                .map(|row| Probe {
-                    existing: row.existing,
-                    resulting: row.resulting.as_ref(),
-                    columns: columns.clone(),
-                })
-                .collect();
-            let openfga =
-                openfga_answers(&engines.model, table, caller, action(write.shape), &probes);
-            for (row, openfga_answer) in target.rows.iter().zip(openfga) {
-                observations.push((
-                    RecordedAnswer {
-                        caller: caller.name.clone(),
-                        row: format!("{}:{}", table.name, row.key),
-                        statement: target.statement.clone(),
-                        postgres: written(&postgres, &row.key),
-                    },
-                    openfga_answer,
-                ));
+            let postgres = postgres::write(database.connection(), table, caller, &target.statement);
+            for key in &target.keys {
+                observations.push(RecordedAnswer {
+                    caller: caller.name.clone(),
+                    row: format!("{}:{key}", table.name),
+                    statement: target.statement.clone(),
+                    postgres: written(&postgres, key),
+                });
             }
         }
     }
     Ok(observations)
 }
 
-/// `OpenFGA`'s answer for each row one statement reaches, one probe per row. PostgreSQL
-/// aborts the whole statement when a row it reaches fails a check on the row it would
-/// produce, so such a row denies every row of the statement.
-fn openfga_answers(
-    model: &Prepared<Model>,
-    table: &Table,
-    caller: &Caller,
-    action: ActionStatement,
-    probes: &[Probe],
-) -> Vec<Answer> {
-    let model = match model {
-        Prepared::Refused(reason) => return vec![Answer::Refused(reason.clone()); probes.len()],
-        Prepared::Ready(model) => model,
-    };
-    let verdicts: Vec<Result<Verdict>> = probes
-        .iter()
-        .map(|probe| model.permits(table, caller, action, probe))
-        .collect();
-    let aborted = verdicts
-        .iter()
-        .any(|verdict| matches!(verdict, Ok(Verdict::Aborted)));
-    verdicts
-        .into_iter()
-        .map(|verdict| match verdict {
-            Ok(Verdict::Changed) if !aborted => Answer::Changed,
-            Ok(_) => Answer::Denied,
-            Err(error) => Answer::Error(format!("{error:#}")),
-        })
-        .collect()
-}
-
-/// The `OpenFGA` translator's schema verdict.
-fn acceptance(case: &Case, model: &Prepared<Model>) -> Acceptance {
-    Acceptance {
-        case: case.name.clone(),
-        sqlite: None,
-        openfga: match model {
-            Prepared::Ready(model) => model.divergence().map(ToOwned::to_owned),
-            Prepared::Refused(reason) => Some(reason.clone()),
-        },
-    }
-}
-
 /// One write statement a caller runs and the rows it answers for.
-struct Target<'a> {
+struct Target {
     statement: String,
-    rows: Vec<TargetRow<'a>>,
+    keys: Vec<String>,
 }
 
-struct TargetRow<'a> {
-    key: String,
-    /// The seeded row the statement reaches, absent for an insert.
-    existing: Option<&'a Value>,
-    /// The row the table owner's run of the statement produces, absent for a delete.
-    resulting: Option<Value>,
-}
-
-/// Spell `write` on `table` per seeded row, or once for the table when it names no row.
-fn targets<'a>(
-    table: &Table,
-    write: &Write,
-    rows: &'a [Value],
-    database: &mut Database,
-) -> Result<Vec<Target<'a>>> {
+/// Spell a write for each row it reaches or once for a whole-table statement.
+fn targets(table: &Table, write: &Write, rows: &[Value]) -> Result<Vec<Target>> {
     let key_of = |row: &Value| table.row_key(|column| row.get(column));
     match write.shape {
-        Shape::Insert => {
-            let key = table.row_key(|column| write.row.get(column))?;
-            Ok(vec![Target {
-                statement: table.write_statement(write, None),
-                rows: vec![TargetRow {
-                    key,
-                    existing: None,
-                    resulting: database.resulting(&table.resulting_statement(write, None))?,
-                }],
-            }])
-        }
-        Shape::UpdateWithoutWhere => {
-            let mut target_rows = Vec::new();
-            for row in rows {
-                target_rows.push(TargetRow {
-                    key: key_of(row)?,
-                    existing: Some(row),
-                    resulting: database.resulting(&table.resulting_statement(write, Some(row)))?,
-                });
-            }
-            Ok(vec![Target {
-                statement: table.write_statement(write, None),
-                rows: target_rows,
-            }])
-        }
+        Shape::Insert => Ok(vec![Target {
+            statement: table.write_statement(write, None),
+            keys: vec![table.row_key(|column| write.row.get(column))?],
+        }]),
+        Shape::UpdateWithoutWhere => Ok(vec![Target {
+            statement: table.write_statement(write, None),
+            keys: rows.iter().map(key_of).collect::<Result<_, _>>()?,
+        }]),
         _ => rows
             .iter()
             .map(|row| {
-                let key = key_of(row)?;
-                let resulting = if write.shape == Shape::Delete {
-                    None
-                } else {
-                    database.resulting(&table.resulting_statement(write, Some(row)))?
-                };
                 Ok(Target {
                     statement: table.write_statement(write, Some(row)),
-                    rows: vec![TargetRow {
-                        key,
-                        existing: Some(row),
-                        resulting,
-                    }],
+                    keys: vec![key_of(row)?],
                 })
             })
             .collect(),

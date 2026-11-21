@@ -3,10 +3,8 @@
 mod case;
 mod connetto;
 mod generator;
-mod openfga;
 mod postgres;
 mod record;
-mod rows;
 mod runner;
 
 pub use generator::{Construct, generate};
@@ -17,12 +15,6 @@ pub use sql_traits::parity::{Answer, Engine};
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
-
-#[derive(Debug)]
-pub(crate) enum Prepared<T> {
-    Ready(T),
-    Refused(String),
-}
 
 /// What one write statement did on a database.
 pub(crate) enum Outcome {

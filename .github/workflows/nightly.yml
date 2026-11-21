@@ -36,15 +36,15 @@ jobs:
           --health-retries 30
     env:
       DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
-      OPENFGA_URL: http://127.0.0.1:8080
+      OPENFGA_URL: http://127.0.0.1:8081
       OPENFGA_CONTAINER: rlspar-nightly-fga-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal && rustup default stable
       - name: Start OpenFGA
         run: |
-          docker run -d --name "$OPENFGA_CONTAINER" -p 127.0.0.1:8080:8080 openfga/openfga:v1.11.6 run
-          timeout 60 bash -c 'until curl --fail --silent "$OPENFGA_URL/healthz"; do sleep 1; done'
+          docker run -d --name "$OPENFGA_CONTAINER" -p 127.0.0.1:8080:8080 -p 127.0.0.1:8081:8081 openfga/openfga:v1.11.6 run
+          timeout 60 bash -c 'until curl --fail --silent http://127.0.0.1:8080/healthz; do sleep 1; done'
       - run: cargo update
       - run: nice -n 10 cargo build --release
       - name: Seed from the date
