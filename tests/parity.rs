@@ -1,8 +1,8 @@
 use std::{path::Path, time::Duration};
 
 use rls_parity::{
-    Answer, KnownList, Measurements, generate, observe_cases, observe_suite, read_known, record,
-    recorded, verify_recorded,
+    Answer, KnownList, Measurements, generate, observe_cases, observe_fixture, observe_suite,
+    read_known, record, verify_recorded,
 };
 use sql_traits::parity::{Case, CaseKnown, Engine, EngineAnswer, Recorded, fixtures};
 
@@ -14,13 +14,14 @@ fn live_known_entry_acceptance() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     omitted_table_seed_is_skipped(root, &database_url, &openfga_url)
         .expect("omitted replica table observations");
-    let measurements = observe_suite(&root.join("cases"), &database_url, &openfga_url)
-        .expect("live three-engine observations");
+    let measurements =
+        observe_suite(root, &database_url, &openfga_url).expect("live three-engine observations");
     assert_eq!(measurements.acceptances.len(), 27);
     assert!(measurements.errors.is_empty(), "{:?}", measurements.errors);
     recorded_fixtures_hold_each_case(root, &measurements).expect("recorded fixtures");
     removing_each_entry_reports_exactly_that_divergence(&measurements)
         .expect("shared known entries");
+    changed_recording_fails_live_run(&database_url, &openfga_url).expect("live oracle mutation");
     fixture_edge_cases(root, &database_url, &openfga_url).expect("edge-case observations");
     let listed = read_known(&root.join("known.toml")).expect("known constructs");
     generated_failure_replays(root, &database_url, &openfga_url, &listed)
@@ -41,8 +42,23 @@ fn generated_failure_replays(
     let unlisted = KnownList::default();
     let failed = generate(0, one_draw, &unlisted, database_url, openfga_url, &failures)?;
     assert_eq!(failed, 1);
-    let replayed = observe_cases(&failures, database_url, openfga_url)?;
+    let local = directory.path().join("cases/connetto_deployment");
+    std::fs::create_dir_all(&local)?;
+    for file in ["seed.sql", "callers.toml"] {
+        std::fs::copy(
+            root.join("cases/connetto_deployment").join(file),
+            local.join(file),
+        )?;
+    }
+    let replayed = observe_suite(directory.path(), database_url, openfga_url)?;
+    assert_eq!(replayed.acceptances.len(), 28);
     assert_ne!(replayed.errors, Vec::<String>::new());
+    assert!(
+        replayed
+            .errors
+            .iter()
+            .all(|error| error.contains("seed0-0"))
+    );
     let listed = directory.path().join("listed");
     assert_eq!(
         generate(0, one_draw, known, database_url, openfga_url, &listed)?,
@@ -82,18 +98,35 @@ fn recorded_fixtures_hold_each_case(
             assert_eq!(known, fixture.known);
         }
     }
-    let fixture = fixtures().next().expect("embedded fixture")?;
-    let oracle = recorded(
-        measurements
-            .observations
-            .iter()
-            .filter(|observation| observation.case == fixture.case.name),
+    Ok(())
+}
+
+/// A changed recording fails the same live measurement path as the default suite.
+fn changed_recording_fails_live_run(database_url: &str, openfga_url: &str) -> anyhow::Result<()> {
+    let mut fixture = fixtures().next().expect("embedded fixture")?;
+    let name = fixture.case.name.clone();
+    let expected = fixture.recorded.answer[0].clone();
+    fixture.recorded.answer[0].postgres = Answer::Error("mutated recorded answer".into());
+    let measurements = observe_fixture(fixture, database_url, openfga_url)?;
+    assert_eq!(measurements.errors.len(), 1);
+    let error = &measurements.errors[0];
+    for witness in [
+        &name,
+        &expected.caller,
+        &expected.row,
+        "mutated recorded answer",
+    ] {
+        assert!(error.contains(witness), "{error}");
+    }
+    assert!(
+        error.contains(&format!("{:?}", expected.statement)),
+        "{error}"
     );
-    let mut changed = fixture.recorded;
-    changed.answer[0].postgres = Answer::Error("mutated recorded answer".into());
-    let error = verify_recorded(&fixture.case.name, &changed, &oracle)
-        .expect_err("mutated recording must disagree with live PostgreSQL");
-    assert!(error.to_string().contains("mutated recorded answer"));
+    assert!(
+        error.contains(&format!("postgres: {:?}", expected.postgres)),
+        "{error}"
+    );
+    assert_eq!(measurements.observations[0].postgres, expected.postgres);
     Ok(())
 }
 

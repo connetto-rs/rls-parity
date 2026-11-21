@@ -85,38 +85,55 @@ pub fn observe_cases(
     directories.sort();
     let mut measurements = Measurements::default();
     for directory in directories {
-        let case = case::read(&directory).map_err(|source| RunError::Case {
-            path: directory.clone(),
-            source,
-        })?;
-        let fixture = Fixture {
-            case,
-            recorded: Recorded::default(),
-            known: CaseKnown::default(),
-        };
-        measure_fixture(fixture, false, database_url, openfga_url, &mut measurements).map_err(
-            |source| RunError::Case {
+        case::read(&directory)
+            .and_then(|case| {
+                let fixture = Fixture {
+                    case,
+                    recorded: Recorded::default(),
+                    known: CaseKnown::default(),
+                };
+                measure_fixture(fixture, false, database_url, openfga_url, &mut measurements)
+            })
+            .map_err(|source| RunError::Case {
                 path: directory,
                 source,
-            },
-        )?;
+            })?;
     }
     Ok(measurements)
 }
 
-/// Measure embedded fixtures and the local cases.
+/// Measure embedded fixtures, local cases and saved failures under `root`.
 ///
 /// # Errors
 /// Returns the case and cause when loading or measuring fails.
 pub fn observe_suite(root: &Path, database_url: &str, openfga_url: &str) -> Result<Measurements> {
     let mut measurements = Measurements::default();
     for fixture in fixtures() {
-        measure_fixture(fixture?, true, database_url, openfga_url, &mut measurements)?;
+        measurements.extend(observe_fixture(fixture?, database_url, openfga_url)?);
     }
-    let local = observe_cases(root, database_url, openfga_url)?;
-    measurements.acceptances.extend(local.acceptances);
-    measurements.observations.extend(local.observations);
-    measurements.errors.extend(local.errors);
+    measurements.extend(observe_cases(
+        &root.join("cases"),
+        database_url,
+        openfga_url,
+    )?);
+    let failures = root.join("failures");
+    if failures.exists() {
+        measurements.extend(observe_cases(&failures, database_url, openfga_url)?);
+    }
+    Ok(measurements)
+}
+
+/// Measure and judge one fixture against live PostgreSQL.
+///
+/// # Errors
+/// Returns the cause when engine setup or measurement fails.
+pub fn observe_fixture(
+    fixture: Fixture,
+    database_url: &str,
+    openfga_url: &str,
+) -> Result<Measurements> {
+    let mut measurements = Measurements::default();
+    measure_fixture(fixture, true, database_url, openfga_url, &mut measurements)?;
     Ok(measurements)
 }
 
