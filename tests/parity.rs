@@ -1,8 +1,8 @@
 use std::{path::Path, time::Duration};
 
 use rls_parity::{
-    Answer, Direction, Engine, Known, KnownList, Measurements, compare, generate, observe_cases,
-    read_known,
+    Answer, CaseKnown, Direction, Engine, Known, KnownList, Measurements, Recorded, compare,
+    generate, observe_cases, read_known, record,
 };
 
 /// Every recorded discrepancy must be necessary and must remain a discrepancy.
@@ -23,6 +23,7 @@ fn live_known_entry_acceptance() {
     assert_eq!(compare(&measurements, &known), Vec::<String>::new());
     removing_each_entry_reports_exactly_that_divergence(&measurements, &mut known);
     stale_agreement_reports_three_answers(&measurements, &mut known);
+    recorded_fixtures_hold_each_case(root, &measurements, &known).expect("recorded fixtures");
     fixture_edge_cases(root, &database_url, &openfga_url).expect("edge-case observations");
     let listed = read_known(&root.join("known.toml")).expect("known discrepancies");
     generated_failure_replays(root, &database_url, &openfga_url, &listed)
@@ -51,6 +52,94 @@ fn generated_failure_replays(
         0
     );
     assert!(!listed.exists());
+    Ok(())
+}
+
+/// `record` writes every files case, leaves out the connetto case, copies each case's files
+/// unchanged, and writes exactly that case's PostgreSQL answers and known entries.
+fn recorded_fixtures_hold_each_case(
+    root: &Path,
+    measurements: &Measurements,
+    known: &KnownList,
+) -> anyhow::Result<()> {
+    let directory = tempfile::tempdir_in(root.join("target"))?;
+    let out = directory.path().join("fixtures");
+    let cases = root.join("cases");
+    let written = record(&cases, measurements, known, &out)?;
+    assert_eq!(written, measurements.acceptances.len() - 1);
+    assert!(!out.join("connetto_deployment").exists());
+    for acceptance in &measurements.acceptances {
+        let name = &acceptance.case;
+        if name == "connetto_deployment" {
+            continue;
+        }
+        let case = out.join(name);
+        for file in ["schema.sql", "seed.sql", "callers.toml"] {
+            assert_eq!(
+                std::fs::read(case.join(file))?,
+                std::fs::read(cases.join(name).join(file))?,
+                "{name}/{file}"
+            );
+        }
+        let recorded: Recorded =
+            toml::from_str(&std::fs::read_to_string(case.join("postgres.toml"))?)?;
+        let expected: Vec<_> = measurements
+            .observations
+            .iter()
+            .filter(|observation| &observation.case == name)
+            .map(|observation| {
+                (
+                    observation.caller.as_str(),
+                    observation.row.as_str(),
+                    observation.statement.as_str(),
+                    &observation.postgres,
+                )
+            })
+            .collect();
+        let answers: Vec<_> = recorded
+            .answer
+            .iter()
+            .map(|answer| {
+                (
+                    answer.caller.as_str(),
+                    answer.row.as_str(),
+                    answer.statement.as_str(),
+                    &answer.postgres,
+                )
+            })
+            .collect();
+        assert_eq!(answers, expected, "{name}/postgres.toml");
+        let listed = known
+            .known
+            .iter()
+            .filter(|entry| &entry.case == name)
+            .count();
+        let refused = known
+            .refusal
+            .iter()
+            .filter(|entry| &entry.case == name)
+            .count();
+        let path = case.join("known.toml");
+        if listed + refused == 0 {
+            assert!(!path.exists(), "{name} has no known entries");
+            continue;
+        }
+        let case_known: CaseKnown = toml::from_str(&std::fs::read_to_string(path)?)?;
+        let engines = [&case_known.sqlite, &case_known.openfga];
+        assert_eq!(
+            engines.iter().map(|engine| engine.row.len()).sum::<usize>(),
+            listed,
+            "{name}/known.toml rows"
+        );
+        assert_eq!(
+            engines
+                .iter()
+                .filter(|engine| engine.refusal.is_some())
+                .count(),
+            refused,
+            "{name}/known.toml refusals"
+        );
+    }
     Ok(())
 }
 

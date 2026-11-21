@@ -5,11 +5,13 @@ mod connetto;
 mod generator;
 mod openfga;
 mod postgres;
+mod record;
 mod rows;
 mod runner;
 mod sqlite;
 
 pub use generator::{Construct, generate};
+pub use record::{CaseKnown, EngineKnown, KnownRow, Recorded, RecordedAnswer, fixture, record};
 pub use runner::{RunError, observe_cases, read_known};
 
 use std::collections::BTreeSet;
@@ -96,7 +98,7 @@ pub enum Engine {
 }
 
 /// The way an answer differs from PostgreSQL.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Direction {
     Wider,
@@ -192,23 +194,26 @@ pub fn compare(measurements: &Measurements, known: &KnownList) -> Vec<String> {
     errors
 }
 
-/// Report schemas exactly one translator refuses unless listed, and listed refusals that
-/// disappeared.
+/// Report each translator's refusal of a schema unless listed for that engine, and listed
+/// refusals that disappeared.
 fn compare_acceptances(acceptances: &[Acceptance], known: &[KnownRefusal]) -> Vec<String> {
     let mut seen = vec![false; known.len()];
     let mut errors = Vec::new();
     for acceptance in acceptances {
-        let engine = match (&acceptance.sqlite, &acceptance.openfga) {
-            (Some(_), None) => Engine::Sqlite,
-            (None, Some(_)) => Engine::Openfga,
-            _ => continue,
-        };
-        match known
-            .iter()
-            .position(|entry| entry.case == acceptance.case && entry.engine == engine)
-        {
-            Some(index) => seen[index] = true,
-            None => errors.push(format!("Unlisted {engine:?} refusal {acceptance:?}")),
+        for (engine, refusal) in [
+            (Engine::Sqlite, &acceptance.sqlite),
+            (Engine::Openfga, &acceptance.openfga),
+        ] {
+            if refusal.is_none() {
+                continue;
+            }
+            match known
+                .iter()
+                .position(|entry| entry.case == acceptance.case && entry.engine == engine)
+            {
+                Some(index) => seen[index] = true,
+                None => errors.push(format!("Unlisted {engine:?} refusal {acceptance:?}")),
+            }
         }
     }
     for (entry, seen) in known.iter().zip(seen) {
@@ -336,8 +341,8 @@ mod tests {
         }
     }
 
-    /// A schema exactly one translator refuses fails unless listed for that engine, and a
-    /// listed refusal fails once both translators agree.
+    /// A schema a translator refuses fails unless listed for that engine, whatever the
+    /// other translator answers, and a listed refusal fails once that translator accepts.
     #[test]
     fn refusal_parity() {
         let listed = KnownList {
@@ -371,11 +376,12 @@ mod tests {
         assert_eq!(errors.len(), 2, "{errors:?}");
         assert!(errors[0].contains("Unlisted Openfga refusal"));
         assert!(errors[1].contains("Stale known refusal"));
-        for (sqlite, openfga) in [(None, None), (Some("one"), Some("other"))] {
-            let errors = compare(&measured(sqlite, openfga), &listed);
-            assert_eq!(errors.len(), 1, "{errors:?}");
-            assert!(errors[0].contains("Stale known refusal"));
-        }
+        let errors = compare(&measured(None, None), &listed);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("Stale known refusal"));
+        let errors = compare(&measured(Some("one"), Some("other")), &listed);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("Unlisted Openfga refusal"));
     }
 
     /// Visibility, write outcomes, translation refusals and execution failures have distinct

@@ -18,7 +18,7 @@ A `[[known]]` entry in `known.toml` identifies each row discrepancy by `case`, `
 
 An engine answer carrying PostgreSQL's own error, as a runtime error or as a translation refusal, agrees with PostgreSQL. Any other engine error counts as a discrepancy, even when both engines reject the read. A read of a table the replica leaves out answers PostgreSQL's privilege error for every oracle row.
 
-Each case also records whether each translator accepts its schema, the way connetto gates it. `pg2sqlite` accepts when it translates the schema for every acting role. `rls2fga` accepts when `Translation::outputs` succeeds, so a note that diverges from the database refuses it, while row comparisons keep running on `outputs_accepting_gaps`. A schema exactly one of them refuses is a discrepancy unless a `[[refusal]]` entry in `known.toml` lists its `case`, the refusing `engine` and the `finding`.
+Each case also records whether each translator accepts its schema, the way connetto gates it. `pg2sqlite` accepts when it translates the schema for every acting role. `rls2fga` accepts when `Translation::outputs` succeeds, so a note that diverges from the database refuses it, while row comparisons keep running on `outputs_accepting_gaps`. A translator refusing a schema is a discrepancy, whatever the other translator answers, unless a `[[refusal]]` entry in `known.toml` lists its `case`, that `engine` and the `finding`.
 
 Cases cover role inheritance, several acting roles, caller settings, grants, policy interactions, writes, and table layouts. Both `to_role_member` variants use the declared acting role.
 
@@ -37,6 +37,10 @@ cargo llvm-cov report --include-build-script --lcov --output-path lcov.info
 ```
 
 `Cargo.lock` remains local. The runner creates and removes each case database and its roles. Pass `-- --known PATH` to test an alternate known list.
+
+## Record
+
+`cargo run --release -- record --out PATH` runs the comparison and, when it passes, copies every case not built from connetto into `PATH`. Each copy adds `postgres.toml`, an `[[answer]]` per caller, row and statement with PostgreSQL's answer. A case with known discrepancies also gets a `known.toml` with a `[sqlite]` and an `[openfga]` table, each holding the engine's `refusal` finding and its `[[sqlite.row]]` or `[[openfga.row]]` entries with `caller`, `row`, `statement`, `direction` and `finding`. Either engine's crate can then replay a case against `postgres.toml` without running PostgreSQL as the oracle.
 
 ## Generate
 
