@@ -12,7 +12,8 @@ fn main() -> Result<()> {
     let known = read_known(Path::new("known.toml"))?;
     let database_url = env::var("DATABASE_URL")
         .context("Set DATABASE_URL to a dedicated PostgreSQL 18 cluster")?;
-    let openfga_url = env::var("OPENFGA_URL").context("Set OPENFGA_URL to OpenFGA v1.11.6")?;
+    let openfga_url = env::var("OPENFGA_URL")
+        .context("Set OPENFGA_URL to the OpenFGA v1.11.6 gRPC endpoint on port 8081")?;
     match command {
         Command::Compare => {
             let measurements = observe_suite(Path::new("."), &database_url, &openfga_url)?;
