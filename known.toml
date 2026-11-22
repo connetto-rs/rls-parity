@@ -1,22 +1,7 @@
 [[construct]]
-construct = "uuid_setting_cast"
-engine = "sqlite"
-finding = "4, the declared text caller setting is cast to `UUID` by the policy"
-
-[[construct]]
-construct = "uuid_setting_cast"
-engine = "openfga"
-finding = "4, the `UUID` caller cast falls below the translation confidence threshold"
-
-[[construct]]
 construct = "column_grant"
 engine = "sqlite"
 finding = "5, SQLite exposes a column without its `SELECT` grant"
-
-[[construct]]
-construct = "column_grant"
-engine = "openfga"
-finding = "5, denied column access is hidden while PostgreSQL raises a privilege error"
 
 [[construct]]
 construct = "grant_without_select"
@@ -24,26 +9,11 @@ engine = "sqlite"
 finding = "5, the replica omits a table while PostgreSQL raises a privilege error"
 
 [[construct]]
-construct = "grant_without_select"
-engine = "openfga"
-finding = "5, missing `SELECT` privilege is hidden while PostgreSQL raises a privilege error"
-
-[[construct]]
 construct = "grant_without_write"
 engine = "sqlite"
 finding = "5, the replica skips a row the caller cannot read before raising the missing `UPDATE` or `DELETE` privilege"
 
 [[construct]]
-construct = "locking_read_update_policy"
-engine = "sqlite"
-finding = "9, the replica drops `FOR UPDATE` and skips the `UPDATE` policies a locking read applies"
-
-[[construct]]
 construct = "update_without_where"
 engine = "sqlite"
 finding = "9, a blind `UPDATE` on the replica reaches only the rows the caller reads"
-
-[[construct]]
-construct = "membership_under_rls"
-engine = "openfga"
-finding = "8, rls2fga refuses a membership table under its own row level security, which the replica translates"

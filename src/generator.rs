@@ -23,7 +23,7 @@ use crate::{KnownList, observe_cases};
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
 #[serde(rename_all = "snake_case")]
 pub enum Construct {
-    /// A policy casts the text caller setting to `UUID`.
+    /// A policy casts the `uuid` caller setting `app.user_uuid` to compare a `UUID` column.
     UuidSettingCast,
     /// A role reads a table through a column grant instead of a table grant.
     ColumnGrant,
@@ -84,7 +84,7 @@ enum Predicate {
     Membership,
     Flag,
     Constant(bool),
-    /// A `UUID` column holds the caller, cast from the text setting.
+    /// A `UUID` column holds the caller, read from the `uuid` setting.
     UuidOwner,
     /// A JSON column's `owner` field is the caller.
     JsonOwner,
@@ -344,6 +344,12 @@ fn quoted(text: &str) -> String {
 }
 
 const CALLER: &str = "current_setting('app.user_id', true)";
+const UUID_CALLER: &str = "current_setting('app.user_uuid', true)";
+
+const SETTINGS: &str = "[[settings]]\nname = \"app.user_id\"\nvalue = { caller = \"text\" }\n\n\
+    [[settings]]\nname = \"app.user_uuid\"\nvalue = { caller = \"uuid\" }\n\n\
+    [[settings]]\nname = \"app.subjects\"\n\
+    value = { set = { element = \"text\", packing = { delimited = \",\" } } }\n";
 
 impl Draft {
     /// Spell the case without any construct `disabled` lists.
@@ -382,7 +388,11 @@ impl Draft {
                 values.join(", ")
             ));
         }
+        let uuid_caller = enabled(Construct::UuidSettingCast);
         let mut callers = Vec::new();
+        if uuid_caller {
+            callers.push(SETTINGS.to_owned());
+        }
         for (index, table) in self.tables.iter().enumerate() {
             let name = format!("t{index}");
             schema.extend(table.schema(&name, &enabled));
@@ -422,20 +432,12 @@ impl Draft {
                     .join(", ")
             ));
         }
-        for (index, caller) in self.callers.iter().enumerate() {
-            let subjects: Vec<_> = TEAMS
+        callers.extend(
+            self.callers
                 .iter()
-                .zip(caller.subjects)
-                .filter_map(|(team, held)| held.then_some(*team))
-                .collect();
-            callers.push(format!(
-                "[[callers]]\nname = \"c{index}\"\nrole = \"{}\"\n\
-                 settings = {{ \"app.user_id\" = \"{}\", \"app.subjects\" = \"{}\" }}\n",
-                ROLES[caller.role],
-                user(caller.user),
-                subjects.join(",")
-            ));
-        }
+                .enumerate()
+                .map(|(index, caller)| caller.render(index, uuid_caller)),
+        );
         callers.extend(
             self.writes
                 .iter()
@@ -602,7 +604,7 @@ impl Table {
             Predicate::Constant(value) => value.to_string(),
             Predicate::UuidOwner => match column(|column| matches!(column, ColumnType::Uuid)) {
                 Some(column) if enabled(Construct::UuidSettingCast) => {
-                    format!("{column} = {CALLER}::uuid")
+                    format!("{column} = {UUID_CALLER}::uuid")
                 }
                 _ => owner,
             },
@@ -621,6 +623,29 @@ impl Table {
                 self.predicate(name, right, enabled)
             ),
         }
+    }
+}
+
+impl Caller {
+    /// The `[[callers]]` entry, setting `app.user_uuid` when `uuid_caller` declares it.
+    fn render(&self, index: usize, uuid_caller: bool) -> String {
+        let subjects: Vec<_> = TEAMS
+            .iter()
+            .zip(self.subjects)
+            .filter_map(|(team, held)| held.then_some(*team))
+            .collect();
+        let uuid_setting = if uuid_caller {
+            format!("\"app.user_uuid\" = \"{}\", ", user(self.user))
+        } else {
+            String::new()
+        };
+        format!(
+            "[[callers]]\nname = \"c{index}\"\nrole = \"{}\"\n\
+             settings = {{ \"app.user_id\" = \"{}\", {uuid_setting}\"app.subjects\" = \"{}\" }}\n",
+            ROLES[self.role],
+            user(self.user),
+            subjects.join(",")
+        )
     }
 }
 
@@ -783,6 +808,8 @@ mod tests {
                     continue;
                 }
                 prop_assert!(!case.schema.contains("::uuid"));
+                prop_assert!(!case.schema.contains("app.user_uuid"));
+                prop_assert!(case.config.settings.is_none());
                 prop_assert!(!case.schema.contains("SELECT (id, owner)"));
                 prop_assert!(!case.schema.contains("ON members USING"));
                 prop_assert!(!case.schema.contains("(flag)"));
