@@ -13,7 +13,7 @@ publish = false
 anyhow = "1"
 # The demo deployment's documents and the options connetto translates it under.
 connetto-demo-deployment = { git = "https://github.com/connetto-rs/connetto-rs", branch = "main" }
-connetto-schema = { git = "https://github.com/connetto-rs/connetto-rs", branch = "main" }
+connetto-translate = { git = "https://github.com/connetto-rs/connetto-rs", branch = "main" }
 diesel = { version = "2.3", features = ["postgres", "sqlite", "serde_json"] }
 libsqlite3-sys = { version = "0.38", features = ["bundled"] }
 pg2sqlite = { git = "https://github.com/connetto-rs/pg2sqlite", branch = "main", features = ["parity"] }
