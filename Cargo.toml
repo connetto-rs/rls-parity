@@ -33,7 +33,13 @@ anyhow = "1"
 
 [patch.crates-io]
 sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
-diesel = { git = "https://github.com/diesel-rs/diesel", branch = "main" }
+# pg2sqlite runs its SQL helpers as table-valued functions, which are on diesel#5395
+# and their run-time declaration on diesel#5396, stacked on it. pg2sqlite takes
+# `diesel-dynamic-schema` from that branch, so `diesel` follows it to stay one crate.
+diesel = { git = "https://github.com/diesel-rs/diesel", branch = "upstream/sqlite-table-valued-functions-dynamic" }
+# Follows diesel's patch, so the `SqlState` pg2sqlite reports a refusal with is the
+# type diesel reports a PostgreSQL error's code as.
+sqlstate = { git = "https://github.com/diesel-rs/diesel", branch = "upstream/sqlite-table-valued-functions-dynamic" }
 # `rls2fga` main needs `sql-values` 0.6, which is not yet on crates.io.
 sql-values = { git = "https://github.com/connetto-rs/sql-values", branch = "main" }
 
