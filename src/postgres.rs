@@ -266,14 +266,14 @@ mod tests {
     fn computed_view_key_is_an_error() -> Result<()> {
         let mut connection = resources()?;
         let (table, caller) = probe("resource_codes");
-        let Err(error) = write(
+        let error = write(
             &mut connection,
             &table,
             &caller,
             "UPDATE resource_codes SET parent_id = 0 WHERE resource = 'A'",
-        ) else {
-            panic!("A computed view key named rows");
-        };
+        )
+        .err()
+        .context("A computed view key named rows")?;
         let error = format!("{error:#}");
         assert!(
             error.contains(r#"Resolving what key column resource of view "resource_codes" writes"#),
