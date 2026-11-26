@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use diesel::{
     connection::SimpleConnection,
     dsl::exists,
@@ -72,7 +72,7 @@ struct ModifyTable {
     alias: String,
     /// The plan producing each updated row, its new values first.
     #[serde(rename = "Plans")]
-    plans: Vec<Subplan>,
+    plans: [Subplan; 1],
 }
 
 /// A plan node with the expressions it outputs, deparsed.
@@ -175,21 +175,13 @@ fn versions_query(connection: &mut PgConnection, table: &Table) -> Result<String
         .with_context(|| format!("Resolving what key column {key} of view {name} writes"))?;
         let [ExplainedUpdate { plan }] =
             serde_json::from_str::<[ExplainedUpdate; 1]>(&explained.plan)?;
-        let expression = plan
-            .plans
+        let [Subplan { output }] = plan.plans;
+        let expression = output
             .into_iter()
             .next()
-            .and_then(|subplan| subplan.output.into_iter().next())
-            .with_context(|| format!("The plan of a write through {name} outputs no value"))?;
+            .context("The plan of a write through a view outputs no value")?;
         expressions.insert(key.as_str(), expression);
-        let relation = (plan.schema, plan.relation, plan.alias);
-        match &written {
-            None => written = Some(relation),
-            Some(first) => ensure!(
-                *first == relation,
-                "The key columns of view {name} write different relations"
-            ),
-        }
+        written = Some((plan.schema, plan.relation, plan.alias));
     }
     let (schema, relation, alias) = written.context("A measured view declares no key")?;
     let alias = identifier(&alias);
@@ -224,17 +216,23 @@ fn act_as(connection: &mut PgConnection, caller: &Caller) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// A write through a view renaming its key counts the row it moves out of the view as changed.
-    #[test]
-    fn view_write_counts_rows_moved_out() -> Result<()> {
+    /// A connection holding temporary `resources` rows and two views over them, one renaming
+    /// its key and one computing it.
+    fn resources() -> Result<PgConnection> {
         let mut connection = PgConnection::establish(&std::env::var("DATABASE_URL")?)?;
         connection.batch_execute(
             "CREATE TEMP TABLE resources (id INTEGER PRIMARY KEY, code TEXT UNIQUE NOT NULL, parent_id INTEGER NOT NULL);
             CREATE TEMP VIEW resource_moves AS SELECT code AS resource, parent_id FROM resources WHERE parent_id > 0;
+            CREATE TEMP VIEW resource_codes AS SELECT upper(code) AS resource, parent_id FROM resources;
             INSERT INTO resources VALUES (1, 'a', 1), (2, 'b', 1), (3, 'c', 0);",
         )?;
+        Ok(connection)
+    }
+
+    /// The measured view keyed on `resource`, written by the table owner.
+    fn probe(view: &str) -> (Table, Caller) {
         let table = Table {
-            name: "resource_moves".into(),
+            name: view.into(),
             key: vec!["resource".into()],
             columns: vec!["resource".into(), "parent_id".into()],
         };
@@ -243,6 +241,14 @@ mod tests {
             role: "postgres".into(),
             settings: BTreeMap::new(),
         };
+        (table, caller)
+    }
+
+    /// A write through a view renaming its key counts the row it moves out of the view as changed.
+    #[test]
+    fn view_write_counts_rows_moved_out() -> Result<()> {
+        let mut connection = resources()?;
+        let (table, caller) = probe("resource_moves");
         let outcome = write(
             &mut connection,
             &table,
@@ -251,6 +257,27 @@ mod tests {
         )?;
         assert!(
             matches!(outcome, Outcome::Applied(keys) if keys == BTreeSet::from(["a".to_owned()]))
+        );
+        Ok(())
+    }
+
+    /// A view key no column of the written table holds fails the write instead of naming rows.
+    #[test]
+    fn computed_view_key_is_an_error() -> Result<()> {
+        let mut connection = resources()?;
+        let (table, caller) = probe("resource_codes");
+        let Err(error) = write(
+            &mut connection,
+            &table,
+            &caller,
+            "UPDATE resource_codes SET parent_id = 0 WHERE resource = 'A'",
+        ) else {
+            panic!("A computed view key named rows");
+        };
+        let error = format!("{error:#}");
+        assert!(
+            error.contains(r#"Resolving what key column resource of view "resource_codes" writes"#),
+            "{error}"
         );
         Ok(())
     }
