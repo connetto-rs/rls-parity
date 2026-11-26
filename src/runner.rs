@@ -9,8 +9,7 @@ use anyhow::{Context, Result, ensure};
 use rls2fga::parity::Database;
 use serde_json::Value;
 use sql_traits::parity::{
-    Case, CaseKnown, Engine, Fixture, Recorded, RecordedAnswer, Shape, Table, Write, fixtures,
-    identifier,
+    Case, Engine, Fixture, Recorded, RecordedAnswer, Shape, Table, Write, fixtures, identifier,
 };
 
 use crate::{
@@ -87,9 +86,9 @@ pub fn observe_cases(
         case::read(&directory)
             .and_then(|case| {
                 let fixture = Fixture {
+                    known: case::known(&directory)?,
                     case,
                     recorded: Recorded::default(),
-                    known: CaseKnown::default(),
                 };
                 measure_fixture(fixture, false, database_url, openfga_url, &mut measurements)
             })

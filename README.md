@@ -8,7 +8,7 @@ Compare live PostgreSQL answers with the SQLite replica from `pg2sqlite` and the
 
 `sql_traits::parity::fixtures()` supplies 26 embedded cases with recorded PostgreSQL answers and per-engine known discrepancies. Every run measures PostgreSQL live and fails on the first differing answer in each recording. Both engines are judged through `Fixture::judge`, which rejects unlisted discrepancies and known discrepancies that disappear.
 
-`cases/connetto_deployment` holds the demo's seed and callers. Its schema, deployment and replica options come from connetto, and its callers declare `app.user_id`, `app.subjects` and `app.bot_list`. This case and generated cases use live PostgreSQL answers with no known discrepancies.
+`cases/connetto_deployment` holds the demo's seed and callers. Its schema, deployment and replica options come from connetto, and its callers act as connetto's kind roles and declare `app.user_id`, `app.subjects` and `app.bot_list`. This case and generated cases use live PostgreSQL answers. A local case lists its known discrepancies in its own `known.toml`, in the embedded fixtures' format, and generated cases list none.
 
 Each case declares tables, callers and write probes in `callers.toml`. Reads measure each seeded row, and writes run in rolled-back transactions. SQLite runs `pg2sqlite::parity::replay` and `OpenFGA` runs `rls2fga::parity::replay`, sharing its PostgreSQL row source with the live oracle.
 

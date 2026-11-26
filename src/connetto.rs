@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use connetto_demo_deployment::{POLICIES_SQL, READER_ROLE, ROLES_SQL, SCHEMA_SQL};
-use connetto_translate::{TextIds, UnsetSettings};
+use connetto_translate::{KindRoles, TextIds, UnsetSettings};
 use pg2sqlite::prelude::Pg2SqliteOptions;
 use sql_traits::prelude::Deployment;
 
@@ -15,11 +15,13 @@ pub(crate) fn schema() -> Result<String> {
     Ok([registry.as_str(), ROLES_SQL, POLICIES_SQL, cap.as_str()].join("\n"))
 }
 
-/// The deployment connetto gives both translators, acting as the reader role, with
-/// both caller settings always bound as the demo declares them.
+/// The deployment connetto gives both translators, logging in as the reader role and
+/// acting as the demo's kind roles, with both caller settings always bound as the demo
+/// declares them.
 pub(crate) fn deployment() -> Result<Deployment> {
     Ok(connetto_translate::deployment::<String>(
         READER_ROLE,
+        KindRoles::defaults(),
         UnsetSettings::ALWAYS_BOUND,
     )?)
 }
@@ -28,6 +30,7 @@ pub(crate) fn deployment() -> Result<Deployment> {
 pub(crate) fn replica_options() -> Result<Pg2SqliteOptions> {
     Ok(connetto_translate::query_options::<String>(
         READER_ROLE,
+        KindRoles::defaults(),
         UnsetSettings::ALWAYS_BOUND,
     )?)
 }

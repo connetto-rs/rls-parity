@@ -44,7 +44,7 @@ fn generated_failure_replays(
     assert_eq!(failed, 1);
     let local = directory.path().join("cases/connetto_deployment");
     std::fs::create_dir_all(&local)?;
-    for file in ["seed.sql", "callers.toml"] {
+    for file in ["seed.sql", "callers.toml", "known.toml"] {
         std::fs::copy(
             root.join("cases/connetto_deployment").join(file),
             local.join(file),
@@ -199,7 +199,7 @@ fn embedded_case(name: &str) -> anyhow::Result<Case> {
 #[test]
 fn invalid_suite_inputs() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
-    let directory = tempfile::tempdir_in(root).expect("isolated fixture directory");
+    let directory = tempfile::tempdir_in(&root).expect("isolated fixture directory");
     let error = observe_cases(directory.path(), "", "").expect_err("empty suite");
     assert!(error.to_string().contains("No case directories"));
     let missing = directory.path().join("missing");
@@ -220,6 +220,32 @@ fn invalid_suite_inputs() {
         error
             .to_string()
             .contains(&known_path.display().to_string())
+    );
+    let source = embedded_case("grant_without_update").expect("embedded case");
+    let cases = tempfile::tempdir_in(&root).expect("isolated case directory");
+    let case = cases.path().join(&source.name);
+    std::fs::create_dir(&case).expect("case directory");
+    for (file, content) in [
+        ("schema.sql", source.schema),
+        ("seed.sql", source.seed),
+        (
+            "callers.toml",
+            toml::to_string(&source.config).expect("case callers"),
+        ),
+    ] {
+        std::fs::write(case.join(file), content).expect("case file");
+    }
+    let case_known = case.join("known.toml");
+    std::fs::write(&case_known, "sqlite = false").expect("malformed case known list");
+    let error = observe_cases(cases.path(), "", "").expect_err("malformed case known list");
+    assert!(
+        format!("{:#}", anyhow::Error::from(error)).contains(&case_known.display().to_string())
+    );
+    std::fs::remove_file(&case_known).expect("malformed case known list removed");
+    std::fs::create_dir(&case_known).expect("unreadable case known list");
+    let error = observe_cases(cases.path(), "", "").expect_err("unreadable case known list");
+    assert!(
+        format!("{:#}", anyhow::Error::from(error)).contains(&case_known.display().to_string())
     );
 }
 

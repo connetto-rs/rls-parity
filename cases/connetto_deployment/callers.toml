@@ -38,43 +38,44 @@ name = "users"
 key = ["id"]
 columns = ["id", "login_name"]
 
-# Persons carry the bot-list wildcard, so the cap policies pass them through.
+# Persons act as the authenticated kind and carry the bot-list wildcard, so the cap policies pass them through.
 [[callers]]
 name = "alice"
-role = "connetto_reader"
+role = "authenticated"
 settings = { "app.user_id" = "alice", "app.subjects" = "", "app.bot_list" = "*" }
 
 [[callers]]
 name = "bob_holding_alice"
-role = "connetto_reader"
+role = "authenticated"
 settings = { "app.user_id" = "bob", "app.subjects" = "alice", "app.bot_list" = "*" }
 
 [[callers]]
 name = "carol"
-role = "connetto_reader"
+role = "authenticated"
 settings = { "app.user_id" = "carol", "app.subjects" = "", "app.bot_list" = "*" }
 
-# Bots act for alice under their own lists, which allow some cap verbs and refuse the rest.
+# Bots act for alice as the bot kind under their own lists, which allow some cap verbs and refuse the rest.
+# The demo grants the bot kind no table, so every statement they run is refused before a cap policy applies.
 [[callers]]
 name = "bot_reader"
-role = "connetto_reader"
+role = "bot"
 settings = { "app.user_id" = "alice", "app.subjects" = "", "app.bot_list" = "orders:read,order_lines:read,photos:read,products:read,teams:read,team_members:read,team_notes:read,users:read" }
 
 # A write's checks read other tables through their own cap_read, so write caps alone refuse every write.
 [[callers]]
 name = "bot_writer"
-role = "connetto_reader"
+role = "bot"
 settings = { "app.user_id" = "alice", "app.subjects" = "", "app.bot_list" = "orders:update,order_lines:update,photos:insert,photos:update,photos:delete,team_notes:insert" }
 
 # The same write caps with the reads their WHERE clauses and checks need.
 [[callers]]
 name = "bot_editor"
-role = "connetto_reader"
+role = "bot"
 settings = { "app.user_id" = "alice", "app.subjects" = "", "app.bot_list" = "orders:read,order_lines:read,photos:read,team_members:read,orders:update,order_lines:update,photos:insert,photos:update,photos:delete,team_notes:insert" }
 
 [[callers]]
 name = "bot_unlisted"
-role = "connetto_reader"
+role = "bot"
 settings = { "app.user_id" = "alice", "app.subjects" = "", "app.bot_list" = "" }
 
 [[writes]]
