@@ -3,7 +3,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Context, Result};
 use diesel::{
     connection::SimpleConnection,
-    dsl::exists,
     prelude::*,
     result::Error as DieselError,
     sql_types::{Bool, Nullable, Oid, Text},
@@ -16,9 +15,36 @@ use crate::Outcome;
 diesel::table! {
     pg_catalog.pg_class (oid) {
         oid -> Oid,
+        relname -> Text,
+        relnamespace -> Oid,
         relkind -> CChar,
     }
 }
+
+diesel::table! {
+    pg_catalog.pg_namespace (oid) {
+        oid -> Oid,
+        nspname -> Text,
+    }
+}
+
+diesel::table! {
+    pg_catalog.pg_rewrite (oid) {
+        oid -> Oid,
+        ev_class -> Oid,
+    }
+}
+
+diesel::table! {
+    pg_catalog.pg_depend (classid, objid, refclassid, refobjid) {
+        classid -> Oid,
+        objid -> Oid,
+        refclassid -> Oid,
+        refobjid -> Oid,
+    }
+}
+
+diesel::allow_tables_to_appear_in_same_query!(pg_class, pg_namespace, pg_rewrite, pg_depend);
 
 #[derive(QueryableByName)]
 pub(crate) struct KeyRow {
@@ -148,20 +174,31 @@ pub(crate) fn write(
 /// A view has no row versions, so the rows read are those of the table PostgreSQL rewrites a
 /// write through it onto, rows the write moves out of the view included. PostgreSQL's own plan
 /// of `UPDATE view SET column = column` names that table and the expression over it each key
-/// column writes.
+/// column writes. PostgreSQL checks that plan against each view owner's privileges, and an owner
+/// may not update the key, so the plan runs under the connection's privileges, every view the
+/// write expands through made `security_invoker` inside a savepoint it then rolls back. Runs
+/// inside a transaction the caller rolls back, which undoes that change when planning fails.
 fn versions_query(connection: &mut PgConnection, table: &Table) -> Result<String> {
     let name = identifier(&table.name);
-    let view = diesel::select(exists(
-        pg_class::table
-            .filter(pg_class::oid.nullable().eq(to_regclass(&name)))
-            .filter(pg_class::relkind.eq(b'v')),
-    ))
-    .get_result::<bool>(connection)?;
-    if !view {
+    let Some(view) = pg_class::table
+        .filter(pg_class::oid.nullable().eq(to_regclass(&name)))
+        .filter(pg_class::relkind.eq(b'v'))
+        .select(pg_class::oid)
+        .first::<u32>(connection)
+        .optional()?
+    else {
         return Ok(format!(
             "SELECT {} AS key, CAST(t.xmin AS TEXT) AS version FROM {name} t",
             table.key_sql(|key| text_of("t", key)),
         ));
+    };
+    connection.batch_execute("SAVEPOINT plan")?;
+    for (schema, relation) in expanded_views(connection, view)? {
+        connection.batch_execute(&format!(
+            "ALTER VIEW {}.{} SET (security_invoker = true)",
+            identifier(&schema),
+            identifier(&relation),
+        ))?;
     }
     let mut written = None;
     let mut expressions = BTreeMap::new();
@@ -183,6 +220,7 @@ fn versions_query(connection: &mut PgConnection, table: &Table) -> Result<String
         expressions.insert(key.as_str(), expression);
         written = Some((plan.schema, plan.relation, plan.alias));
     }
+    connection.batch_execute("ROLLBACK TO SAVEPOINT plan")?;
     let (schema, relation, alias) = written.context("A measured view declares no key")?;
     let alias = identifier(&alias);
     Ok(format!(
@@ -191,6 +229,41 @@ fn versions_query(connection: &mut PgConnection, table: &Table) -> Result<String
         identifier(&schema),
         identifier(&relation),
     ))
+}
+
+/// The schema and name of `view` and of every view its rewrite rules reach, transitively.
+fn expanded_views(connection: &mut PgConnection, view: u32) -> Result<Vec<(String, String)>> {
+    let mut expanded = BTreeSet::from([view]);
+    let mut frontier = vec![view];
+    while let Some(relation) = frontier.pop() {
+        let referenced = pg_rewrite::table
+            .inner_join(pg_depend::table.on(pg_depend::objid.eq(pg_rewrite::oid)))
+            .inner_join(pg_class::table.on(pg_class::oid.eq(pg_depend::refobjid)))
+            .filter(pg_rewrite::ev_class.eq(relation))
+            .filter(
+                pg_depend::classid
+                    .nullable()
+                    .eq(to_regclass("pg_catalog.pg_rewrite")),
+            )
+            .filter(
+                pg_depend::refclassid
+                    .nullable()
+                    .eq(to_regclass("pg_catalog.pg_class")),
+            )
+            .filter(pg_class::relkind.eq(b'v'))
+            .select(pg_class::oid)
+            .load::<u32>(connection)?;
+        frontier.extend(
+            referenced
+                .into_iter()
+                .filter(|referenced| expanded.insert(*referenced)),
+        );
+    }
+    Ok(pg_class::table
+        .inner_join(pg_namespace::table.on(pg_namespace::oid.eq(pg_class::relnamespace)))
+        .filter(pg_class::oid.eq_any(expanded))
+        .select((pg_namespace::nspname, pg_class::relname))
+        .load(connection)?)
 }
 
 /// Read each stored row's transaction version under its declared key with `versions`.
@@ -214,6 +287,9 @@ fn act_as(connection: &mut PgConnection, caller: &Caller) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use rls2fga::parity::Database;
+    use sql_traits::parity::{Case, Config};
+
     use super::*;
 
     /// A connection holding temporary `resources` rows and two views over them, one renaming
@@ -257,6 +333,42 @@ mod tests {
         )?;
         assert!(
             matches!(outcome, Outcome::Applied(keys) if keys == BTreeSet::from(["a".to_owned()]))
+        );
+        Ok(())
+    }
+
+    /// A write through views whose owner may update only the moved column, the measured one
+    /// over another, counts the row it moves out of the view as changed.
+    #[test]
+    fn owner_rights_view_write_counts_rows_moved_out() -> Result<()> {
+        let (table, caller) = probe("resource_moves");
+        let case = Case {
+            name: "owner_rights_view".into(),
+            schema: "CREATE ROLE view_key_owner NOLOGIN;
+                CREATE TABLE resources (id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL);
+                GRANT SELECT, UPDATE (parent_id) ON resources TO view_key_owner;
+                CREATE VIEW resource_parents AS SELECT id, parent_id FROM resources WHERE parent_id > 0;
+                CREATE VIEW resource_moves AS SELECT id AS resource, parent_id FROM resource_parents;
+                ALTER VIEW resource_parents OWNER TO view_key_owner;
+                ALTER VIEW resource_moves OWNER TO view_key_owner;"
+                .into(),
+            seed: "INSERT INTO resources VALUES (1, 1), (2, 1);".into(),
+            config: Config {
+                settings: None,
+                tables: vec![table],
+                callers: vec![caller],
+                writes: Vec::new(),
+            },
+        };
+        let mut database = Database::create(&std::env::var("DATABASE_URL")?, &case)?;
+        let outcome = write(
+            database.connection(),
+            &case.config.tables[0],
+            &case.config.callers[0],
+            "UPDATE resource_moves SET parent_id = 0 WHERE resource = 1",
+        )?;
+        assert!(
+            matches!(outcome, Outcome::Applied(keys) if keys == BTreeSet::from(["1".to_owned()]))
         );
         Ok(())
     }
