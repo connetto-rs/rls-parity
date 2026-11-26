@@ -1,7 +1,7 @@
-use std::{fs, path::Path};
+use std::{fs, io::ErrorKind, path::Path};
 
 use anyhow::{Context, Result};
-use sql_traits::parity::{Case, Config};
+use sql_traits::parity::{Case, CaseKnown, Config};
 
 use crate::connetto;
 
@@ -29,5 +29,15 @@ pub(crate) fn read(path: &Path) -> Result<Case> {
     } else {
         let schema = read_file("schema.sql")?;
         Case::parse(name, schema, seed, callers).map_err(Into::into)
+    }
+}
+
+/// Read the discrepancies a local case's `known.toml` lists, none when it has no such file.
+pub(crate) fn known(path: &Path) -> Result<CaseKnown> {
+    let file = path.join("known.toml");
+    match fs::read_to_string(&file) {
+        Ok(text) => toml::from_str(&text).with_context(|| format!("Parsing {}", file.display())),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(CaseKnown::default()),
+        Err(error) => Err(error).with_context(|| format!("Reading {}", file.display())),
     }
 }

@@ -44,7 +44,7 @@ fn generated_failure_replays(
     assert_eq!(failed, 1);
     let local = directory.path().join("cases/connetto_deployment");
     std::fs::create_dir_all(&local)?;
-    for file in ["seed.sql", "callers.toml"] {
+    for file in ["seed.sql", "callers.toml", "known.toml"] {
         std::fs::copy(
             root.join("cases/connetto_deployment").join(file),
             local.join(file),

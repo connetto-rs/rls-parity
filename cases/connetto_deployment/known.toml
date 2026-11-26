@@ -1,0 +1,307 @@
+[[sqlite.row]]
+caller = "bot_reader"
+row = "orders:20000000-0000-4000-8000-000000000001"
+statement = """UPDATE "orders" SET "quantity" = 5 WHERE "id" = '20000000-0000-4000-8000-000000000001'"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_reader"
+row = "orders:20000000-0000-4000-8000-000000000002"
+statement = """UPDATE "orders" SET "quantity" = 5 WHERE "id" = '20000000-0000-4000-8000-000000000002'"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_writer"
+row = "orders:20000000-0000-4000-8000-000000000001"
+statement = """UPDATE "orders" SET "quantity" = 5 WHERE "id" = '20000000-0000-4000-8000-000000000001'"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_writer"
+row = "orders:20000000-0000-4000-8000-000000000002"
+statement = """UPDATE "orders" SET "quantity" = 5 WHERE "id" = '20000000-0000-4000-8000-000000000002'"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_editor"
+row = "orders:20000000-0000-4000-8000-000000000001"
+statement = """UPDATE "orders" SET "quantity" = 5 WHERE "id" = '20000000-0000-4000-8000-000000000001'"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_editor"
+row = "orders:20000000-0000-4000-8000-000000000002"
+statement = """UPDATE "orders" SET "quantity" = 5 WHERE "id" = '20000000-0000-4000-8000-000000000002'"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_unlisted"
+row = "orders:20000000-0000-4000-8000-000000000001"
+statement = """UPDATE "orders" SET "quantity" = 5 WHERE "id" = '20000000-0000-4000-8000-000000000001'"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_unlisted"
+row = "orders:20000000-0000-4000-8000-000000000002"
+statement = """UPDATE "orders" SET "quantity" = 5 WHERE "id" = '20000000-0000-4000-8000-000000000002'"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_reader"
+row = "order_lines:20000000-0000-4000-8000-000000000001,1"
+statement = """UPDATE "order_lines" SET "quantity" = 5 WHERE "order_id" = '20000000-0000-4000-8000-000000000001' AND "line_no" = 1"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_reader"
+row = "order_lines:20000000-0000-4000-8000-000000000001,2"
+statement = """UPDATE "order_lines" SET "quantity" = 5 WHERE "order_id" = '20000000-0000-4000-8000-000000000001' AND "line_no" = 2"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_reader"
+row = "order_lines:20000000-0000-4000-8000-000000000002,1"
+statement = """UPDATE "order_lines" SET "quantity" = 5 WHERE "order_id" = '20000000-0000-4000-8000-000000000002' AND "line_no" = 1"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_writer"
+row = "order_lines:20000000-0000-4000-8000-000000000001,1"
+statement = """UPDATE "order_lines" SET "quantity" = 5 WHERE "order_id" = '20000000-0000-4000-8000-000000000001' AND "line_no" = 1"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_writer"
+row = "order_lines:20000000-0000-4000-8000-000000000001,2"
+statement = """UPDATE "order_lines" SET "quantity" = 5 WHERE "order_id" = '20000000-0000-4000-8000-000000000001' AND "line_no" = 2"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_writer"
+row = "order_lines:20000000-0000-4000-8000-000000000002,1"
+statement = """UPDATE "order_lines" SET "quantity" = 5 WHERE "order_id" = '20000000-0000-4000-8000-000000000002' AND "line_no" = 1"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_editor"
+row = "order_lines:20000000-0000-4000-8000-000000000001,1"
+statement = """UPDATE "order_lines" SET "quantity" = 5 WHERE "order_id" = '20000000-0000-4000-8000-000000000001' AND "line_no" = 1"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_editor"
+row = "order_lines:20000000-0000-4000-8000-000000000001,2"
+statement = """UPDATE "order_lines" SET "quantity" = 5 WHERE "order_id" = '20000000-0000-4000-8000-000000000001' AND "line_no" = 2"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_editor"
+row = "order_lines:20000000-0000-4000-8000-000000000002,1"
+statement = """UPDATE "order_lines" SET "quantity" = 5 WHERE "order_id" = '20000000-0000-4000-8000-000000000002' AND "line_no" = 1"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_unlisted"
+row = "order_lines:20000000-0000-4000-8000-000000000001,1"
+statement = """UPDATE "order_lines" SET "quantity" = 5 WHERE "order_id" = '20000000-0000-4000-8000-000000000001' AND "line_no" = 1"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_unlisted"
+row = "order_lines:20000000-0000-4000-8000-000000000001,2"
+statement = """UPDATE "order_lines" SET "quantity" = 5 WHERE "order_id" = '20000000-0000-4000-8000-000000000001' AND "line_no" = 2"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_unlisted"
+row = "order_lines:20000000-0000-4000-8000-000000000002,1"
+statement = """UPDATE "order_lines" SET "quantity" = 5 WHERE "order_id" = '20000000-0000-4000-8000-000000000002' AND "line_no" = 1"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_reader"
+row = "photos:30000000-0000-4000-8000-000000000001"
+statement = """UPDATE "photos" SET "content_state" = 'ready' WHERE "id" = '30000000-0000-4000-8000-000000000001'"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_reader"
+row = "photos:30000000-0000-4000-8000-000000000002"
+statement = """UPDATE "photos" SET "content_state" = 'ready' WHERE "id" = '30000000-0000-4000-8000-000000000002'"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_writer"
+row = "photos:30000000-0000-4000-8000-000000000001"
+statement = """UPDATE "photos" SET "content_state" = 'ready' WHERE "id" = '30000000-0000-4000-8000-000000000001'"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_writer"
+row = "photos:30000000-0000-4000-8000-000000000002"
+statement = """UPDATE "photos" SET "content_state" = 'ready' WHERE "id" = '30000000-0000-4000-8000-000000000002'"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_editor"
+row = "photos:30000000-0000-4000-8000-000000000001"
+statement = """UPDATE "photos" SET "content_state" = 'ready' WHERE "id" = '30000000-0000-4000-8000-000000000001'"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_editor"
+row = "photos:30000000-0000-4000-8000-000000000002"
+statement = """UPDATE "photos" SET "content_state" = 'ready' WHERE "id" = '30000000-0000-4000-8000-000000000002'"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_unlisted"
+row = "photos:30000000-0000-4000-8000-000000000001"
+statement = """UPDATE "photos" SET "content_state" = 'ready' WHERE "id" = '30000000-0000-4000-8000-000000000001'"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_unlisted"
+row = "photos:30000000-0000-4000-8000-000000000002"
+statement = """UPDATE "photos" SET "content_state" = 'ready' WHERE "id" = '30000000-0000-4000-8000-000000000002'"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_reader"
+row = "photos:30000000-0000-4000-8000-000000000001"
+statement = """DELETE FROM "photos" WHERE "id" = '30000000-0000-4000-8000-000000000001'"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_reader"
+row = "photos:30000000-0000-4000-8000-000000000002"
+statement = """DELETE FROM "photos" WHERE "id" = '30000000-0000-4000-8000-000000000002'"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_writer"
+row = "photos:30000000-0000-4000-8000-000000000001"
+statement = """DELETE FROM "photos" WHERE "id" = '30000000-0000-4000-8000-000000000001'"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_writer"
+row = "photos:30000000-0000-4000-8000-000000000002"
+statement = """DELETE FROM "photos" WHERE "id" = '30000000-0000-4000-8000-000000000002'"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_editor"
+row = "photos:30000000-0000-4000-8000-000000000001"
+statement = """DELETE FROM "photos" WHERE "id" = '30000000-0000-4000-8000-000000000001'"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_editor"
+row = "photos:30000000-0000-4000-8000-000000000002"
+statement = """DELETE FROM "photos" WHERE "id" = '30000000-0000-4000-8000-000000000002'"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_unlisted"
+row = "photos:30000000-0000-4000-8000-000000000001"
+statement = """DELETE FROM "photos" WHERE "id" = '30000000-0000-4000-8000-000000000001'"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_unlisted"
+row = "photos:30000000-0000-4000-8000-000000000002"
+statement = """DELETE FROM "photos" WHERE "id" = '30000000-0000-4000-8000-000000000002'"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_reader"
+row = "photos:30000000-0000-4000-8000-000000000003"
+statement = '''INSERT INTO "photos" ("content_id", "id", "order_id", "owner_id", "team_id") VALUES ('\x03', '30000000-0000-4000-8000-000000000003', '20000000-0000-4000-8000-000000000001', 'alice', 'red')'''
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_writer"
+row = "photos:30000000-0000-4000-8000-000000000003"
+statement = '''INSERT INTO "photos" ("content_id", "id", "order_id", "owner_id", "team_id") VALUES ('\x03', '30000000-0000-4000-8000-000000000003', '20000000-0000-4000-8000-000000000001', 'alice', 'red')'''
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_editor"
+row = "photos:30000000-0000-4000-8000-000000000003"
+statement = '''INSERT INTO "photos" ("content_id", "id", "order_id", "owner_id", "team_id") VALUES ('\x03', '30000000-0000-4000-8000-000000000003', '20000000-0000-4000-8000-000000000001', 'alice', 'red')'''
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_unlisted"
+row = "photos:30000000-0000-4000-8000-000000000003"
+statement = '''INSERT INTO "photos" ("content_id", "id", "order_id", "owner_id", "team_id") VALUES ('\x03', '30000000-0000-4000-8000-000000000003', '20000000-0000-4000-8000-000000000001', 'alice', 'red')'''
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_reader"
+row = "team_notes:40000000-0000-4000-8000-000000000002"
+statement = """INSERT INTO "team_notes" ("author_id", "body", "id", "team_id") VALUES ('alice', 'retro', '40000000-0000-4000-8000-000000000002', 'red')"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_writer"
+row = "team_notes:40000000-0000-4000-8000-000000000002"
+statement = """INSERT INTO "team_notes" ("author_id", "body", "id", "team_id") VALUES ('alice', 'retro', '40000000-0000-4000-8000-000000000002', 'red')"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_editor"
+row = "team_notes:40000000-0000-4000-8000-000000000002"
+statement = """INSERT INTO "team_notes" ("author_id", "body", "id", "team_id") VALUES ('alice', 'retro', '40000000-0000-4000-8000-000000000002', 'red')"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bot_unlisted"
+row = "team_notes:40000000-0000-4000-8000-000000000002"
+statement = """INSERT INTO "team_notes" ("author_id", "body", "id", "team_id") VALUES ('alice', 'retro', '40000000-0000-4000-8000-000000000002', 'red')"""
+direction = "different_denial"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
