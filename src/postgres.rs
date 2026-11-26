@@ -1,15 +1,24 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::Result;
+use anyhow::{Context, Result, ensure};
 use diesel::{
     connection::SimpleConnection,
+    dsl::exists,
     prelude::*,
     result::Error as DieselError,
-    sql_types::{Bool, Text},
+    sql_types::{Bool, Nullable, Oid, Text},
 };
+use serde::Deserialize;
 use sql_traits::parity::{Caller, Table, identifier, text_of};
 
 use crate::Outcome;
+
+diesel::table! {
+    pg_catalog.pg_class (oid) {
+        oid -> Oid,
+        relkind -> CChar,
+    }
+}
 
 #[derive(QueryableByName)]
 pub(crate) struct KeyRow {
@@ -42,6 +51,42 @@ fn changed(
 #[diesel::declare_sql_function]
 extern "SQL" {
     fn set_config(name: Text, value: Text, local: Bool) -> Text;
+    fn to_regclass(name: Text) -> Nullable<Oid>;
+}
+
+/// `EXPLAIN (FORMAT JSON)` of an `UPDATE`, holding its one plan.
+#[derive(Deserialize)]
+struct ExplainedUpdate {
+    #[serde(rename = "Plan")]
+    plan: ModifyTable,
+}
+
+/// The plan node writing the relation an `UPDATE` lands on.
+#[derive(Deserialize)]
+struct ModifyTable {
+    #[serde(rename = "Schema")]
+    schema: String,
+    #[serde(rename = "Relation Name")]
+    relation: String,
+    #[serde(rename = "Alias")]
+    alias: String,
+    /// The plan producing each updated row, its new values first.
+    #[serde(rename = "Plans")]
+    plans: Vec<Subplan>,
+}
+
+/// A plan node with the expressions it outputs, deparsed.
+#[derive(Deserialize)]
+struct Subplan {
+    #[serde(rename = "Output")]
+    output: Vec<String>,
+}
+
+/// One row of `EXPLAIN` output.
+#[derive(QueryableByName)]
+struct Explained {
+    #[diesel(sql_type = Text, column_name = "QUERY PLAN")]
+    plan: String,
 }
 
 /// Run a caller's read and collect the returned row keys.
@@ -75,7 +120,8 @@ pub(crate) fn write(
 ) -> Result<Outcome> {
     connection.batch_execute("BEGIN")?;
     let result = (|| {
-        let before = stored(connection, table)?;
+        let versions = versions_query(connection, table)?;
+        let before = stored(connection, &versions)?;
         act_as(connection, caller)?;
         // The case supplies its write statement at runtime.
         if let Err(error) = diesel::sql_query(statement).execute(connection) {
@@ -89,25 +135,80 @@ pub(crate) fn write(
         connection.batch_execute("RESET ROLE")?;
         Ok(Outcome::Applied(changed(
             &before,
-            &stored(connection, table)?,
+            &stored(connection, &versions)?,
         )))
     })();
     connection.batch_execute("ROLLBACK")?;
     result
 }
 
-/// Read each stored row's transaction version under its declared key.
-fn stored(connection: &mut PgConnection, table: &Table) -> Result<BTreeMap<String, String>> {
-    // The case supplies the table and row key at runtime.
-    Ok(diesel::sql_query(format!(
-        "SELECT {} AS key, CAST(t.xmin AS TEXT) AS version FROM {} t",
-        table.key_sql(|key| text_of("t", key)),
-        identifier(&table.name)
+/// The query reading each row version of the relation a write on `table` lands on, named under
+/// `table`'s key.
+///
+/// A view has no row versions, so the rows read are those of the table PostgreSQL rewrites a
+/// write through it onto, rows the write moves out of the view included. PostgreSQL's own plan
+/// of `UPDATE view SET column = column` names that table and the expression over it each key
+/// column writes.
+fn versions_query(connection: &mut PgConnection, table: &Table) -> Result<String> {
+    let name = identifier(&table.name);
+    let view = diesel::select(exists(
+        pg_class::table
+            .filter(pg_class::oid.nullable().eq(to_regclass(&name)))
+            .filter(pg_class::relkind.eq(b'v')),
     ))
-    .load::<StoredRow>(connection)?
-    .into_iter()
-    .map(|row| (row.key, row.version))
-    .collect())
+    .get_result::<bool>(connection)?;
+    if !view {
+        return Ok(format!(
+            "SELECT {} AS key, CAST(t.xmin AS TEXT) AS version FROM {name} t",
+            table.key_sql(|key| text_of("t", key)),
+        ));
+    }
+    let mut written = None;
+    let mut expressions = BTreeMap::new();
+    for key in &table.key {
+        let column = identifier(key);
+        // The typed DSL cannot spell `EXPLAIN`, and the case supplies the view and key at runtime.
+        let explained = diesel::sql_query(format!(
+            "EXPLAIN (VERBOSE, COSTS OFF, FORMAT JSON) UPDATE {name} SET {column} = {column}"
+        ))
+        .get_result::<Explained>(connection)
+        .with_context(|| format!("Resolving what key column {key} of view {name} writes"))?;
+        let [ExplainedUpdate { plan }] =
+            serde_json::from_str::<[ExplainedUpdate; 1]>(&explained.plan)?;
+        let expression = plan
+            .plans
+            .into_iter()
+            .next()
+            .and_then(|subplan| subplan.output.into_iter().next())
+            .with_context(|| format!("The plan of a write through {name} outputs no value"))?;
+        expressions.insert(key.as_str(), expression);
+        let relation = (plan.schema, plan.relation, plan.alias);
+        match &written {
+            None => written = Some(relation),
+            Some(first) => ensure!(
+                *first == relation,
+                "The key columns of view {name} write different relations"
+            ),
+        }
+    }
+    let (schema, relation, alias) = written.context("A measured view declares no key")?;
+    let alias = identifier(&alias);
+    Ok(format!(
+        "SELECT {} AS key, CAST({alias}.xmin AS TEXT) AS version FROM {}.{} {alias}",
+        table.key_sql(|key| format!("CAST(({}) AS TEXT)", expressions[key])),
+        identifier(&schema),
+        identifier(&relation),
+    ))
+}
+
+/// Read each stored row's transaction version under its declared key with `versions`.
+fn stored(connection: &mut PgConnection, versions: &str) -> Result<BTreeMap<String, String>> {
+    // The case supplies the relation and row key at runtime.
+    Ok(diesel::sql_query(versions)
+        .load::<StoredRow>(connection)?
+        .into_iter()
+        .map(|row| (row.key, row.version))
+        .collect())
 }
 
 /// Take the caller's role and settings for the current transaction.
@@ -117,4 +218,40 @@ fn act_as(connection: &mut PgConnection, caller: &Caller) -> Result<()> {
         diesel::select(set_config(name, value, true)).get_result::<String>(connection)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A write through a view renaming its key counts the row it moves out of the view as changed.
+    #[test]
+    fn view_write_counts_rows_moved_out() -> Result<()> {
+        let mut connection = PgConnection::establish(&std::env::var("DATABASE_URL")?)?;
+        connection.batch_execute(
+            "CREATE TEMP TABLE resources (id INTEGER PRIMARY KEY, code TEXT UNIQUE NOT NULL, parent_id INTEGER NOT NULL);
+            CREATE TEMP VIEW resource_moves AS SELECT code AS resource, parent_id FROM resources WHERE parent_id > 0;
+            INSERT INTO resources VALUES (1, 'a', 1), (2, 'b', 1), (3, 'c', 0);",
+        )?;
+        let table = Table {
+            name: "resource_moves".into(),
+            key: vec!["resource".into()],
+            columns: vec!["resource".into(), "parent_id".into()],
+        };
+        let caller = Caller {
+            name: "owner".into(),
+            role: "postgres".into(),
+            settings: BTreeMap::new(),
+        };
+        let outcome = write(
+            &mut connection,
+            &table,
+            &caller,
+            "UPDATE resource_moves SET parent_id = 0 WHERE resource = 'a'",
+        )?;
+        assert!(
+            matches!(outcome, Outcome::Applied(keys) if keys == BTreeSet::from(["a".to_owned()]))
+        );
+        Ok(())
+    }
 }
